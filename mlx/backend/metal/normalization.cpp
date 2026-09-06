@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <algorithm>
 
 #include "mlx/backend/gpu/copy.h"
@@ -58,6 +59,18 @@ void RMSNorm::eval_gpu(
   std::string op_name = "rms";
   if (axis_size > looped_limit) {
     op_name += "_looped";
+  }
+  // Occam measurement build (capability gap G1). MLX_RMS_PRECISE=1 selects a
+  // forward that composes norm x gain in float and rounds once, instead of
+  // rounding the normalized value first. The default is unchanged, so stock
+  // models keep Llama-faithful numerics; see Occam RESEARCH-TOOLING F6.
+  // Read once per process: a mid-run change must not silently alter results.
+  static const bool rms_precise = []() {
+    const char* v = std::getenv("MLX_RMS_PRECISE");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (rms_precise) {
+    op_name += "_precise";
   }
   op_name += type_to_name(out);
   auto& compute_encoder = metal::get_command_encoder(s);
