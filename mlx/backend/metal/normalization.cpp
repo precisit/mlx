@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 #include <algorithm>
+#include <cstdlib>
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
@@ -58,6 +59,13 @@ void RMSNorm::eval_gpu(
   std::string op_name = "rms";
   if (axis_size > looped_limit) {
     op_name += "_looped";
+  }
+  static const bool rms_precise = []() {
+    const char* v = std::getenv("MLX_RMS_PRECISE");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (rms_precise) {
+    op_name += "_precise";
   }
   op_name += type_to_name(out);
   auto& compute_encoder = metal::get_command_encoder(s);
