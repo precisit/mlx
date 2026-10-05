@@ -4811,11 +4811,13 @@ array quantized_matmul(
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
+  bool int8_compute =
+      qmode == QuantizationMode::Affine && transpose && env::qmm_int8();
   return array(
       std::move(out_shape),
       dtype,
       std::make_shared<QuantizedMatmul>(
-          to_stream(s), group_size, bits, qmode, transpose),
+          to_stream(s), group_size, bits, qmode, transpose, int8_compute),
       std::move(inputs));
 }
 

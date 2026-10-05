@@ -227,6 +227,13 @@ inline bool enable_tf32() {
   return enable_tf32_;
 }
 
+// Run eligible affine quantized matmuls on the int8 lane (staged int8 weights
+// and int8 activations). Not cached: each op captures the value when it is
+// built, so it can be changed between calls.
+inline bool qmm_int8() {
+  return get_var("MLX_QMM_INT8", 0);
+}
+
 inline int nccl_timeout(int default_value) {
   static int nccl_timeout = get_var("MLX_NCCL_TIMEOUT", default_value);
   return nccl_timeout;

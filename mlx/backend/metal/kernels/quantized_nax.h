@@ -1665,3 +1665,304 @@ template <
     });
   });
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// Staged int8 qmm
+//
+// The affine weights are folded to int8 in threadgroup memory, the
+// activations are quantized to int8, and the product runs on the
+// int8 x int8 -> int32 matmul:
+//
+//   w[n, k]  = scale[n, g] * q[n, k] + bias[n, g]
+//   sw[n]    = max_g max(|bias|, |scale * q_max + bias|) / 127
+//   w8[n, k] = round(w[n, k] / sw[n])
+//   sx[m]    = max_k |x[m, k]| / 127
+//   x8[m, k] = round(x[m, k] / sx[m])
+//   y[m, n]  = sx[m] * sw[n] * sum_k x8[m, k] * w8[n, k]
+//
+// One scale per row on both sides keeps the accumulation in int32 across the
+// whole of K, so the only floating point work is a final scaling.
+///////////////////////////////////////////////////////////////////////////////
+
+// The fold w8 = (q * a + b) >> QMM_I8_FRAC is done in fixed point with
+// a = round(scale / sw * 2^FRAC) and b = round(bias / sw * 2^FRAC) + 2^(FRAC-1)
+MLX_MTL_CONST int QMM_I8_FRAC = 16;
+
+// Unpack four consecutive codes. The packed weights are a little-endian bit
+// stream, `p` points at a pack boundary and `i` counts groups of four codes.
+template <int bits>
+inline int4 qmm_i8_unpack4(const device uint8_t* p, int i) {
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  constexpr uint mask = (1u << bits) - 1u;
+  const int offset = 4 * bits * i;
+  p += offset >> 3;
+
+  uint w = p[0];
+  if (bits > 2) {
+    w |= uint(p[1]) << 8;
+  }
+  if (bits > 4) {
+    w |= uint(p[2]) << 16;
+  }
+  if (bits > 6) {
+    w |= uint(p[3]) << 24;
+  }
+  w >>= (offset & 7);
+
+  return int4(
+      w & mask,
+      (w >> bits) & mask,
+      (w >> (2 * bits)) & mask,
+      (w >> (3 * bits)) & mask);
+}
+
+// One float scale per output row of the weights and its fixed point reciprocal
+template <typename T, const int bits>
+[[kernel]] void affine_qmm_i8_row_scales(
+    const device T* scales [[buffer(0)]],
+    const device T* biases [[buffer(1)]],
+    device float* w_scale [[buffer(2)]],
+    device float* w_inv [[buffer(3)]],
+    const constant int& K_g [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]) {
+  constexpr float q_max = float((1 << bits) - 1);
+
+  scales += size_t(tid) * K_g;
+  biases += size_t(tid) * K_g;
+
+  float extent = 0.0f;
+  for (int g = 0; g < K_g; g++) {
+    const float s = float(scales[g]);
+    const float b = float(biases[g]);
+    extent = max(extent, max(fabs(b), fabs(fma(s, q_max, b))));
+  }
+
+  const float sw = max(extent * (1.0f / 127.0f), 1e-30f);
+  w_scale[tid] = sw;
+  w_inv[tid] = float(1 << QMM_I8_FRAC) / sw;
+}
+
+// Quantize each row of x to int8 with its own scale. One threadgroup per row
+// and 64 values per thread, so the dispatch uses K / 64 threads per
+// threadgroup.
+//
+// The output is laid out for the matmul that consumes it: x8 is stored tile by
+// tile as [M / MT][K / KC][MT][KC], so that every MT x KC tile the matmul reads
+// is one contiguous run of memory. Rows past M pad the last tile and are
+// zeroed.
+template <typename T>
+[[kernel]] void affine_qmm_i8_quantize_x(
+    const device T* x [[buffer(0)]],
+    device int8_t* x8 [[buffer(1)]],
+    device float* x_scale [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    const constant int& M [[buffer(4)]],
+    const constant int& MT [[buffer(5)]],
+    const constant int& KC [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint n_simd [[simdgroups_per_threadgroup]]) {
+  constexpr int PER = 64;
+
+  threadgroup float shared[34];
+
+  const int row = tid.y;
+  const int k = lid * PER;
+  const size_t tile = size_t(row / MT) * (K / KC) + k / KC;
+  device char4* q = (device char4*)(x8 + (tile * MT + row % MT) * KC + k % KC);
+
+  if (row >= M) {
+    for (int i = 0; i < PER / 4; i++) {
+      q[i] = char4(0);
+    }
+    return;
+  }
+
+  x += size_t(row) * K + k;
+
+  float vals[PER];
+  float amax = 0.0f;
+  for (int i = 0; i < PER; i++) {
+    vals[i] = float(x[i]);
+    amax = max(amax, fabs(vals[i]));
+  }
+  amax = simd_max(amax);
+  if (simd_lid == 0) {
+    shared[simd_gid] = amax;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (lid == 0) {
+    float row_max = shared[0];
+    for (uint i = 1; i < n_simd; i++) {
+      row_max = max(row_max, shared[i]);
+    }
+    const float sx = max(row_max * (1.0f / 127.0f), 1e-12f);
+    shared[32] = sx;
+    shared[33] = 1.0f / sx;
+    x_scale[row] = sx;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv = shared[33];
+  for (int i = 0; i < PER / 4; i++) {
+    const float4 v =
+        float4(vals[4 * i], vals[4 * i + 1], vals[4 * i + 2], vals[4 * i + 3]) *
+        inv;
+    q[i] = char4(clamp(int4(round(v)), -127, 127));
+  }
+}
+
+// Each threadgroup computes an MT x NT tile of the output. The NT x KC tile of
+// the weights is folded to int8 in threadgroup memory once per KC columns and
+// is shared by all MT rows, so the decode work per multiply-accumulate falls
+// with MT: the tiles are tall. The accumulator holds MT * NT / (32 * SG)
+// elements per thread and 64 is as many as stay in registers.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int MT,
+    const int NT,
+    const int KC,
+    const int SG>
+[[kernel]] void affine_qmm_t_nax_i8(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device float* w_inv [[buffer(3)]],
+    const device float* w_scale [[buffer(4)]],
+    const device int8_t* x8 [[buffer(5)]],
+    const device float* x_scale [[buffer(6)]],
+    device T* y [[buffer(7)]],
+    const constant int& K [[buffer(8)]],
+    const constant int& N [[buffer(9)]],
+    const constant int& M [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]) {
+  // Staged values per thread per K-chunk, in runs that share a scale and bias
+  constexpr int TGS = SG * 32;
+  constexpr int VPT = (NT * KC) / TGS;
+  constexpr int RUN = VPT < group_size ? VPT : group_size;
+
+  static_assert(TGS % NT == 0, "A thread stages within one row of the tile");
+  static_assert(VPT % 8 == 0, "A thread stages whole packs of the weights");
+  static_assert(
+      VPT % RUN == 0 && group_size % RUN == 0,
+      "A run of staged values lies within one quantization group");
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+
+  threadgroup uint Ws_storage[(NT * KC) / 4];
+  threadgroup int8_t* Ws = (threadgroup int8_t*)Ws_storage;
+
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      MT,
+      NT,
+      KC,
+      /* transpose_left = */ false,
+      /* transpose_right = */ true,
+      /* relaxed_precision = */ true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SG>> gemm_op;
+
+  const int y_row = tid.y * MT;
+  const int y_col = tid.x * NT;
+
+  // x8 holds one contiguous MT x KC tile per (row tile, K-chunk)
+  const int n_chunks = K / KC;
+  const int x_tile_0 = tid.y * n_chunks;
+  const int n_x_tiles = ((M + MT - 1) / MT) * n_chunks;
+
+  using x_tensor_t = metal::
+      tensor<device int8_t, metal::dextents<int32_t, 2>, metal::tensor_inline>;
+  using w_tensor_t = metal::tensor<
+      threadgroup int8_t,
+      metal::dextents<int32_t, 2>,
+      metal::tensor_inline>;
+
+  x_tensor_t x_tensor(
+      (device int8_t*)x8, metal::dextents<int32_t, 2>(KC, n_x_tiles * MT));
+  w_tensor_t w_tile(Ws, metal::dextents<int32_t, 2>(KC, NT));
+
+  auto x_first = x_tensor.template slice<KC, MT>(0, x_tile_0 * MT);
+  auto acc = gemm_op.template get_destination_cooperative_tensor<
+      decltype(x_first),
+      w_tensor_t,
+      int32_t>();
+
+  STEEL_PRAGMA_UNROLL
+  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+    if (acc.is_valid_element(i)) {
+      acc[i] = 0;
+    }
+  }
+
+  // The part of the weight tile this thread stages
+  const int e0 = lid * VPT;
+  const int nl = e0 / KC;
+  const int kl = e0 % KC;
+  const int n = y_col + nl;
+  const bool valid = n < N;
+
+  threadgroup int8_t* dst = Ws + nl * KC + kl;
+  const device uint8_t* wl = (const device uint8_t*)w;
+  float inv = 0.0f;
+  if (valid) {
+    wl += size_t(n) * (K / pack_factor) * bytes_per_pack;
+    scales += size_t(n) * (K / group_size);
+    biases += size_t(n) * (K / group_size);
+    inv = w_inv[n];
+  } else {
+    for (int i = 0; i < VPT / 4; i++) {
+      *(threadgroup uint*)(dst + 4 * i) = 0;
+    }
+  }
+
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (valid) {
+      STEEL_PRAGMA_UNROLL
+      for (int r = 0; r < VPT / RUN; r++) {
+        const int kk = k0 + kl + r * RUN;
+        const int a = int(rint(float(scales[kk / group_size]) * inv));
+        const int b = int(rint(float(biases[kk / group_size]) * inv)) +
+            (1 << (QMM_I8_FRAC - 1));
+        const device uint8_t* p = wl + (kk / pack_factor) * bytes_per_pack;
+
+        STEEL_PRAGMA_UNROLL
+        for (int i = 0; i < RUN / 4; i++) {
+          const int4 q = qmm_i8_unpack4<bits>(p, i);
+          const int4 v = (q * a + b) >> QMM_I8_FRAC;
+          *(threadgroup uint*)(dst + r * RUN + 4 * i) = as_type<uint>(char4(v));
+        }
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto x_tile = x_tensor.template slice<KC, MT>(0, (x_tile_0 + k0 / KC) * MT);
+    gemm_op.run(x_tile, w_tile, acc);
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
+    if (acc.is_valid_element(i)) {
+      auto idx = acc.get_multidimensional_index(i);
+      const int r = y_row + int(idx[1]);
+      const int c = y_col + int(idx[0]);
+      if (r < M && c < N) {
+        y[size_t(r) * N + c] =
+            static_cast<T>(float(acc[i]) * x_scale[r] * w_scale[c]);
+      }
+    }
+  }
+}
