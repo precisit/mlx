@@ -1698,20 +1698,24 @@ inline int4 qmm_i8_unpack4(const device uint8_t* p, int i) {
       "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
 
   constexpr uint mask = (1u << bits) - 1u;
-  const int offset = 4 * bits * i;
-  p += offset >> 3;
 
-  uint w = p[0];
-  if (bits > 2) {
-    w |= uint(p[1]) << 8;
+  uint w;
+  if (bits == 4) {
+    w = *(const device uint16_t*)(p + 2 * i);
+  } else if (bits == 8) {
+    w = *(const device uint32_t*)(p + 4 * i);
+  } else {
+    const int offset = 4 * bits * i;
+    p += offset >> 3;
+    w = p[0];
+    if (bits > 2) {
+      w |= uint(p[1]) << 8;
+    }
+    if (bits > 4) {
+      w |= uint(p[2]) << 16;
+    }
+    w >>= (offset & 7);
   }
-  if (bits > 4) {
-    w |= uint(p[2]) << 16;
-  }
-  if (bits > 6) {
-    w |= uint(p[3]) << 24;
-  }
-  w >>= (offset & 7);
 
   return int4(
       w & mask,
@@ -1819,19 +1823,16 @@ template <typename T>
   }
 }
 
-// Each threadgroup computes an MT x NT tile of the output. The NT x KC tile of
-// the weights is folded to int8 in threadgroup memory once per KC columns and
-// is shared by all MT rows, so the decode work per multiply-accumulate falls
-// with MT: the tiles are tall. The accumulator holds MT * NT / (32 * SG)
-// elements per thread and 64 is as many as stay in registers.
-template <
-    typename T,
-    const int group_size,
-    const int bits,
-    const int MT,
-    const int NT,
-    const int KC,
-    const int SG>
+// The number of output rows of the weights. It is a function constant rather
+// than an argument because the matmul below is about 12% slower on M6 when N is
+// only known at run time, and N is a property of the weights, not of a request.
+constant int qmm_i8_N [[function_constant(210)]];
+
+// The matmul has the structure of qmm_t_nax_tgp_impl: a 64 x 64 tile of the
+// output per threadgroup, a 32 x 32 tile per simdgroup, and the weights of each
+// 64 columns of K staged in threadgroup memory. Here the staged weights and the
+// fragments are int8 and the accumulator is int32.
+template <typename T, const int group_size, const int bits>
 [[kernel]] void affine_qmm_t_nax_i8(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -1842,77 +1843,52 @@ template <
     const device float* x_scale [[buffer(6)]],
     device T* y [[buffer(7)]],
     const constant int& K [[buffer(8)]],
-    const constant int& N [[buffer(9)]],
-    const constant int& M [[buffer(10)]],
+    const constant int& M [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]]) {
-  // Staged values per thread per K-chunk, in runs that share a scale and bias
-  constexpr int TGS = SG * 32;
-  constexpr int VPT = (NT * KC) / TGS;
-  constexpr int RUN = VPT < group_size ? VPT : group_size;
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+  const int N = qmm_i8_N;
 
-  static_assert(TGS % NT == 0, "A thread stages within one row of the tile");
-  static_assert(VPT % 8 == 0, "A thread stages whole packs of the weights");
+  constexpr int BM = 64;
+  constexpr int BN = 64;
+  constexpr int BK = 64;
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int BK_padded = BK + 16;
+
+  // Each thread folds VPT consecutive weights of one row of the tile. They
+  // share a quantization group, so one scale and bias.
+  constexpr int VPT = (BN * BK) / (WM * WN * SIMD_SIZE);
   static_assert(
-      VPT % RUN == 0 && group_size % RUN == 0,
-      "A run of staged values lies within one quantization group");
+      VPT % 8 == 0 && BK % VPT == 0 && group_size % VPT == 0,
+      "A thread stages whole packs of the weights within one group");
 
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  threadgroup uint Ws_storage[(NT * KC) / 4];
+  threadgroup uint Ws_storage[(BN * BK_padded) / 4];
   threadgroup int8_t* Ws = (threadgroup int8_t*)Ws_storage;
 
-  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-      MT,
-      NT,
-      KC,
-      /* transpose_left = */ false,
-      /* transpose_right = */ true,
-      /* relaxed_precision = */ true,
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<SG>> gemm_op;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
 
-  const int y_row = tid.y * MT;
-  const int y_col = tid.x * NT;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
 
-  // x8 holds one contiguous MT x KC tile per (row tile, K-chunk)
-  const int n_chunks = K / KC;
-  const int x_tile_0 = tid.y * n_chunks;
-  const int n_x_tiles = ((M + MT - 1) / MT) * n_chunks;
-
-  using x_tensor_t = metal::
-      tensor<device int8_t, metal::dextents<int32_t, 2>, metal::tensor_inline>;
-  using w_tensor_t = metal::tensor<
-      threadgroup int8_t,
-      metal::dextents<int32_t, 2>,
-      metal::tensor_inline>;
-
-  x_tensor_t x_tensor(
-      (device int8_t*)x8, metal::dextents<int32_t, 2>(KC, n_x_tiles * MT));
-  w_tensor_t w_tile(Ws, metal::dextents<int32_t, 2>(KC, NT));
-
-  auto x_first = x_tensor.template slice<KC, MT>(0, x_tile_0 * MT);
-  auto acc = gemm_op.template get_destination_cooperative_tensor<
-      decltype(x_first),
-      w_tensor_t,
-      int32_t>();
-
-  STEEL_PRAGMA_UNROLL
-  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
-    if (acc.is_valid_element(i)) {
-      acc[i] = 0;
-    }
-  }
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
 
   // The part of the weight tile this thread stages
-  const int e0 = lid * VPT;
-  const int nl = e0 / KC;
-  const int kl = e0 % KC;
+  const int nl = lid / (BK / VPT);
+  const int kl = (lid % (BK / VPT)) * VPT;
   const int n = y_col + nl;
   const bool valid = n < N;
 
-  threadgroup int8_t* dst = Ws + nl * KC + kl;
+  threadgroup int8_t* dst = Ws + nl * BK_padded + kl;
   const device uint8_t* wl = (const device uint8_t*)w;
   float inv = 0.0f;
   if (valid) {
@@ -1926,43 +1902,79 @@ template <
     }
   }
 
-  for (int k0 = 0; k0 < K; k0 += KC) {
+  // x8 holds one contiguous BM x BK block per (row tile, BK columns of K)
+  x8 += (size_t(tid.y) * (K / BK) * BM + tm) * BK;
+
+  NAXTile<int32_t, TM, TN> Dtile;
+  Dtile.clear();
+
+  for (int k = 0; k < K; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (valid) {
-      STEEL_PRAGMA_UNROLL
-      for (int r = 0; r < VPT / RUN; r++) {
-        const int kk = k0 + kl + r * RUN;
-        const int a = int(rint(float(scales[kk / group_size]) * inv));
-        const int b = int(rint(float(biases[kk / group_size]) * inv)) +
-            (1 << (QMM_I8_FRAC - 1));
-        const device uint8_t* p = wl + (kk / pack_factor) * bytes_per_pack;
+      const int kk = k + kl;
+      const int a = int(rint(float(scales[kk / group_size]) * inv));
+      const int b = int(rint(float(biases[kk / group_size]) * inv)) +
+          (1 << (QMM_I8_FRAC - 1));
+      const device uint8_t* p = wl + (kk / pack_factor) * bytes_per_pack;
 
-        STEEL_PRAGMA_UNROLL
-        for (int i = 0; i < RUN / 4; i++) {
-          const int4 q = qmm_i8_unpack4<bits>(p, i);
-          const int4 v = (q * a + b) >> QMM_I8_FRAC;
-          *(threadgroup uint*)(dst + r * RUN + 4 * i) = as_type<uint>(char4(v));
-        }
+      STEEL_PRAGMA_UNROLL
+      for (int i = 0; i < VPT / 4; i++) {
+        const int4 q = qmm_i8_unpack4<bits>(p, i);
+        const int4 v = (q * a + b) >> QMM_I8_FRAC;
+        *(threadgroup uint*)(dst + 4 * i) = as_type<uint>(char4(v));
       }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    auto x_tile = x_tensor.template slice<KC, MT>(0, (x_tile_0 + k0 / KC) * MT);
-    gemm_op.run(x_tile, w_tile, acc);
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<int8_t, TM, TK> Atile;
+      NAXTile<int8_t, TN, TK> Btile;
+
+      volatile int compiler_barrier;
+
+      Atile.load(x8 + kk1, BK);
+      Btile.template load<int8_t, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<false>{},
+          Btile,
+          metal::bool_constant<true>{});
+
+      (void)compiler_barrier;
+    }
+
+    x8 += BM * BK;
   }
 
-  STEEL_PRAGMA_UNROLL
-  for (uint16_t i = 0; i < acc.get_capacity(); i++) {
-    if (acc.is_valid_element(i)) {
-      auto idx = acc.get_multidimensional_index(i);
-      const int r = y_row + int(idx[1]);
-      const int c = y_col + int(idx[0]);
-      if (r < M && c < N) {
-        y[size_t(r) * N + c] =
-            static_cast<T>(float(acc[i]) * x_scale[r] * w_scale[c]);
+  // Scale and store the results. Only a tile that crosses the edge of the
+  // output checks each element: guarded stores cannot be merged, and guarding
+  // them everywhere costs about 14% of the kernel on M6.
+  const bool interior = (y_row + tm + SM <= M) && (y_col + tn + SN <= N);
+  dispatch_bool(interior, [&](auto kInterior) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < TM; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < TN; j++) {
+        const auto frag = Dtile.frag_at(i, j);
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < BaseNAXFrag::kElemsPerFrag; e++) {
+          const short2 pos = BaseNAXFrag::get_coord(e);
+          const int r = y_row + tm + i * BaseNAXFrag::kFragRows + pos.y;
+          const int c = y_col + tn + j * BaseNAXFrag::kFragCols + pos.x;
+          if constexpr (kInterior.value) {
+            y[size_t(r) * N + c] =
+                static_cast<T>(float(frag[e]) * x_scale[r] * w_scale[c]);
+          } else if (r < M && c < N) {
+            y[size_t(r) * N + c] =
+                static_cast<T>(float(frag[e]) * x_scale[r] * w_scale[c]);
+          }
+        }
       }
     }
-  }
+  });
 }
