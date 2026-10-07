@@ -261,5 +261,6 @@ std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
 bool is_nax_available();
+bool is_nax_fp8_available();
 
 } // namespace mlx::core::metal

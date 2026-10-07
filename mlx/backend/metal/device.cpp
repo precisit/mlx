@@ -986,4 +986,25 @@ bool is_nax_available() {
 #endif
 }
 
+// The fp8 kernels need Metal 4.1 and a GPU with a fast fp8 matmul
+bool is_nax_fp8_available() {
+#if defined(MLX_METAL_NO_NAX) || defined(MLX_METAL_NO_FP8)
+  return false;
+#else
+  auto _check_fp8 = []() {
+    bool can_use_fp8 = false;
+    if (__builtin_available(macOS 27, iOS 27, tvOS 27, visionOS 27, *)) {
+      can_use_fp8 = is_nax_available();
+    }
+    auto& d = metal::device(mlx::core::Device::gpu);
+    auto arch = d.get_architecture().back();
+    auto gen = d.get_architecture_gen();
+    can_use_fp8 &= arch != 'p' && gen >= 18;
+    return can_use_fp8;
+  };
+  static bool is_nax_fp8_available_ = _check_fp8();
+  return is_nax_fp8_available_;
+#endif
+}
+
 } // namespace mlx::core::metal

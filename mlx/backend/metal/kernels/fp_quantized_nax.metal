@@ -119,4 +119,33 @@ instantiate_quantized_types(float)
 instantiate_quantized_types(bfloat16_t)
 instantiate_quantized_types(float16_t)
 instantiate_quantized_qmm_hgs(bfloat16_t)
+
+// Staged fp8 qmm
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 410)
+#define instantiate_qmm_fp8_aligned(type, aligned)  \
+  instantiate_kernel(                              \
+      "mxfp8_qmm_t_nax_fp8_" #type "_al_" #aligned, \
+      fp_qmm_t_nax_fp8,                            \
+      type,                                        \
+      8,                                           \
+      aligned)                                     \
+  instantiate_kernel(                              \
+      "mxfp4_qmm_t_nax_fp8_" #type "_al_" #aligned, \
+      fp_qmm_t_nax_fp8,                            \
+      type,                                        \
+      4,                                           \
+      aligned)
+
+#define instantiate_qmm_fp8(type)       \
+  instantiate_kernel(                   \
+      "fp_qmm_fp8_quantize_x_" #type,   \
+      fp_qmm_fp8_quantize_x,            \
+      type)                             \
+  instantiate_qmm_fp8_aligned(type, true) \
+  instantiate_qmm_fp8_aligned(type, false)
+
+instantiate_qmm_fp8(float)
+instantiate_qmm_fp8(float16_t)
+instantiate_qmm_fp8(bfloat16_t)
+#endif
     // clang-format on

@@ -180,6 +180,10 @@ if(NOT MLX_METAL_JIT)
                  gated_delta_nax_ops.h ${STEEL_NAX_HEADERS})
     build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h
                  ${STEEL_NAX_HEADERS})
+    if(MLX_METAL_VERSION LESS 410)
+      # The fp8 kernels in fp_quantized_nax need Metal 4.1
+      target_compile_definitions(mlx PRIVATE MLX_METAL_NO_FP8)
+    endif()
 
     build_kernel(steel/attn/kernels/steel_attention_nax
                  ${STEEL_NAX_ATTN_HEADERS})

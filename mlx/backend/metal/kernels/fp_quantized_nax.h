@@ -1049,3 +1049,313 @@ template <
     });
   });
 }
+
+// Staged fp8 qmm: x is rounded to fp8 (E4M3) with a power of two scale per row,
+// w is moved to the largest scale of its row, the product is summed in float.
+
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 410)
+
+// Quantize each row of x to fp8 with a power of two scale, one threadgroup per
+// row. The output is stored as [M / 64][K / 64][64][64].
+template <typename T>
+[[kernel]] void fp_qmm_fp8_quantize_x(
+    const device T* x [[buffer(0)]],
+    device uint8_t* x8 [[buffer(1)]],
+    device float* x_scale [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    const constant int& M [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint n_simd [[simdgroups_per_threadgroup]]) {
+  constexpr int BM = 64;
+  constexpr int BK = 64;
+
+  threadgroup float shared[33];
+
+  const int row = tid.y;
+  const int n_blocks = K / BK;
+  const size_t tile = size_t(row / BM) * n_blocks + lid;
+  device packed_uchar4* q =
+      (device packed_uchar4*)(x8 + (tile * BM + row % BM) * BK);
+
+  if (row >= M) {
+    for (int i = 0; i < BK / 4; i++) {
+      q[i] = uchar4(0);
+    }
+    return;
+  }
+
+  x += size_t(row) * K + lid * BK;
+
+  float vals[BK];
+  float block_max = 0.0f;
+  for (int i = 0; i < BK; i++) {
+    vals[i] = float(x[i]);
+    block_max = max(block_max, fabs(vals[i]));
+  }
+  const float simd_row_max = simd_max(block_max);
+  if (simd_lid == 0) {
+    shared[simd_gid] = simd_row_max;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (lid == 0) {
+    float row_max = shared[0];
+    for (uint i = 1; i < n_simd; i++) {
+      row_max = max(row_max, shared[i]);
+    }
+
+    // Smallest power of two sx with row_max / sx <= F8E4M3_MAX (1.75 * 2^8)
+    const uint b = as_type<uint>(max(row_max, 1e-30f));
+    const uint e = (b >> 23) - 8 + ((b & 0x7FFFFFu) > 0x600000u ? 1 : 0);
+    shared[32] = as_type<float>((254u - e) << 23);
+    x_scale[row] = as_type<float>(e << 23);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv = shared[32];
+
+  for (int i = 0; i < BK / 4; i++) {
+    const float4 v =
+        float4(vals[4 * i], vals[4 * i + 1], vals[4 * i + 2], vals[4 * i + 3]);
+    q[i] = metal::pack<metal::metal_fp8_e4m3_format>(v * inv).as_storage_type();
+  }
+}
+
+// 4 fp8 codes times 2^-d, d >= 0, rounded to nearest even. Below the normal
+// range the significand is shifted into the subnormals.
+inline uint qmm_fp8_shift(uint w, int d) {
+  const int4 c = int4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, w >> 24);
+  const int4 sign = c & 0x80;
+  const int4 e = (c >> 3) & 15;
+  const int4 m = c & 7;
+  const int4 e1 = max(e, int4(1));
+  const int4 sig = m + select(int4(0), int4(8), e > 0);
+  const int4 ne = e1 - d;
+  const int4 sh = clamp(d - e1 + 1, int4(0), int4(5));
+  const int4 rounding = (int4(1) << sh) >> 1;
+  const int4 r =
+      select(sig, (sig + rounding - 1 + ((sig >> sh) & 1)) >> sh, sh > 0);
+  const int4 v = sign | select(r, select(r, (ne << 3) | m, ne >= 1), sig >= 8);
+  return as_type<uint>(uchar4(v));
+}
+
+// Stage 32 weights of one quantization group as fp8 at the scale of their
+// row, which is d powers of two above the scale of the group
+template <int bits>
+inline void
+qmm_fp8_stage(const device uint8_t* src, int d, threadgroup uint8_t* dst) {
+  static_assert(
+      bits == 4 || bits == 8, "Template undefined for bits not in {4, 8}");
+
+  if constexpr (bits == 8) {
+    uint4 wa = *(const device packed_uint4*)src;
+    uint4 wb = *(const device packed_uint4*)(src + 16);
+
+    // While every exponent field stays above 0 the shift is a subtraction in
+    // that field
+    const uint4 top = uint4(0x80808080u);
+    const uint4 thr = uint4(uint(d + 1) * 0x08080808u);
+    const bool plain = d < 15 &&
+        all((((wa & 0x78787878u) + top - thr) & top) == top) &&
+        all((((wb & 0x78787878u) + top - thr) & top) == top);
+    if (plain || d == 0) {
+      wa -= uint4(uint(d) * 0x08080808u);
+      wb -= uint4(uint(d) * 0x08080808u);
+    } else {
+      for (int i = 0; i < 4; i++) {
+        wa[i] = qmm_fp8_shift(wa[i], d);
+        wb[i] = qmm_fp8_shift(wb[i], d);
+      }
+    }
+
+    *(threadgroup packed_uint4*)dst = wa;
+    *(threadgroup packed_uint4*)(dst + 16) = wb;
+  } else {
+    // Decode as fp4_e2m1 does, the scale is exact
+    const float scale = 16384.0f * as_type<float>(uint(127 - min(d, 40)) << 23);
+
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < 8; i++) {
+      const uint p = *(const device uint16_t*)(src + 2 * i);
+      const uint4 c = uint4(p & 15u, (p >> 4) & 15u, (p >> 8) & 15u, p >> 12);
+      const float4 mag = float4(as_type<half4>(ushort4((c & 7u) << 9))) * scale;
+      const float4 v = select(mag, -mag, (c & 8u) != 0u);
+      *(threadgroup packed_uchar4*)(dst + 4 * i) =
+          metal::pack<metal::metal_fp8_e4m3_format>(v).as_storage_type();
+    }
+  }
+}
+
+// x @ w.T in tiles of 64 by 64 with one fp8 matmul per simdgroup, the fp8
+// operands are read from memory. With aligned, M and N are multiples of 64.
+template <typename T, const int bits, const bool aligned>
+[[kernel]] void fp_qmm_t_nax_fp8(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    device uint8_t* x8 [[buffer(2)]],
+    const device float* x_scale [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K_ [[buffer(5)]],
+    const constant int& N_ [[buffer(6)]],
+    const constant int& M_ [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+  constexpr int BM = 64;
+  constexpr int BN = 64;
+  constexpr int BK = 64;
+  constexpr int WM = 2;
+  constexpr int WN = 2;
+  constexpr int group_size = 32;
+
+  // Each thread stages VPT weights of one row, all in one quantization group
+  constexpr int VPT = (BN * BK) / (WM * WN * SIMD_SIZE);
+  static_assert(
+      VPT == group_size && BK == 2 * VPT,
+      "Two threads stage a row, one quantization group of the weights each");
+
+  constexpr int SM = BM / WM;
+  constexpr int SN = BN / WN;
+
+  typedef metal::metal_fp8_e4m3_format fp8_t;
+  typedef metal::dextents<int32_t, 2> extents_t;
+  typedef metal::tensor<device fp8_t, extents_t, metal::tensor_inline> x_t;
+  typedef metal::tensor<threadgroup fp8_t, extents_t, metal::tensor_inline> w_t;
+
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      SM,
+      SN,
+      BK,
+      false,
+      true,
+      true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+  threadgroup uint Ws_storage[(BN * BK) / 4];
+  threadgroup uint8_t* Ws = (threadgroup uint8_t*)Ws_storage;
+  threadgroup uint8_t Ss[2 * BN];
+  threadgroup float Wscales[BN];
+
+  const int K = K_;
+  const int N = N_;
+  const int M = M_;
+  (void)M;
+
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+  const int tm = SM * (simd_gid / WN);
+  const int tn = SN * (simd_gid % WN);
+
+  // The part of the weight tile this thread stages
+  const int nl = lid / 2;
+  const int kl = (lid % 2) * VPT;
+  const int n = y_col + nl;
+  const bool valid = aligned || n < N;
+
+  threadgroup uint8_t* dst = Ws + nl * BK + kl;
+  const device uint8_t* wl = (const device uint8_t*)w;
+  if (valid) {
+    wl += (size_t(n) * K + kl) * bits / 8;
+    scales += size_t(n) * (K / group_size);
+  } else {
+    for (int i = 0; i < VPT / 4; i++) {
+      *(threadgroup uint*)(dst + 4 * i) = 0;
+    }
+  }
+
+  // The largest scale of a row of the weights, each of its two threads
+  // looks at half of the row
+  {
+    uint8_t s = 0;
+    if (valid) {
+      const int n_scales = K / BK;
+      const device uint8_t* sp = scales + (lid % 2) * n_scales;
+      uchar4 s4 = uchar4(0);
+      int g = 0;
+      for (; g + 4 <= n_scales; g += 4) {
+        s4 = max(s4, uchar4(*(const device packed_uchar4*)(sp + g)));
+      }
+      s = max(max(s4.x, s4.y), max(s4.z, s4.w));
+      for (; g < n_scales; g++) {
+        s = max(s, sp[g]);
+      }
+    }
+    Ss[lid] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const int row_scale = max(Ss[lid], Ss[lid ^ 1]);
+  if (kl == 0) {
+    Wscales[nl] = dequantize_scale<float, 32>(uint8_t(row_scale));
+  }
+  // The scales this thread stages with
+  scales += kl / group_size;
+
+  // x8 has one BM x BK block per row tile and BK columns of K
+  x8 += (size_t(tid.y) * (K / BK) * BM + tm) * BK;
+
+  w_t Wtile(Ws + tn * BK, extents_t(BK, SN));
+  auto Dtile =
+      gemm_op.template get_destination_cooperative_tensor<x_t, w_t, float>();
+  for (ushort i = 0; i < Dtile.get_capacity(); i++) {
+    Dtile[i] = 0.0f;
+  }
+
+  for (int k = 0; k < K; k += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (valid) {
+      qmm_fp8_stage<bits>(
+          wl + k * bits / 8, row_scale - int(scales[k / group_size]), dst);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    x_t Xtile(x8, extents_t(BK, SM));
+    gemm_op.run(Xtile, Wtile, Dtile);
+
+    x8 += BM * BK;
+  }
+
+  // A 64-bit index from the corner of the tile, a 32-bit one is slower
+  device T* y_tile = y + (size_t(y_row + tm) * size_t(N) + size_t(y_col + tn));
+
+  // A test on the stores of a cooperative tensor is slow, even one for the
+  // whole tile, so there is none when the output has whole tiles only
+  if constexpr (aligned) {
+    for (ushort i = 0; i < Dtile.get_capacity(); i++) {
+      if (Dtile.is_valid_element(i)) {
+        const auto pos = Dtile.get_multidimensional_index(i);
+        const int r = y_row + tm + int(pos[1]);
+        const int c = tn + int(pos[0]);
+        y_tile[size_t(pos[1]) * size_t(N) + size_t(pos[0])] =
+            static_cast<T>(Dtile[i] * x_scale[r] * Wscales[c]);
+      }
+    }
+  } else {
+    const bool interior = (y_row + tm + SM <= M) && (y_col + tn + SN <= N);
+    dispatch_bool(interior, [&](auto kInterior) {
+      for (ushort i = 0; i < Dtile.get_capacity(); i++) {
+        if (!Dtile.is_valid_element(i)) {
+          continue;
+        }
+        const auto pos = Dtile.get_multidimensional_index(i);
+        const int r = y_row + tm + int(pos[1]);
+        const int c = tn + int(pos[0]);
+        if constexpr (kInterior.value) {
+          y_tile[size_t(pos[1]) * size_t(N) + size_t(pos[0])] =
+              static_cast<T>(Dtile[i] * x_scale[r] * Wscales[c]);
+        } else if (r < M && y_col + c < N) {
+          y_tile[size_t(pos[1]) * size_t(N) + size_t(pos[0])] =
+              static_cast<T>(Dtile[i] * x_scale[r] * Wscales[c]);
+        }
+      }
+    });
+  }
+}
+
+#endif // __METAL_VERSION__ >= 410

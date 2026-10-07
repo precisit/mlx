@@ -438,6 +438,68 @@ class TestQuantized(mlx_tests.MLXTestCase):
                 self.assertLess((y_q - y_hat).abs().max(), tol)
 
     @unittest.skipIf("CI" in os.environ, "too slow in CI")
+    def test_qmm_int8(self):
+        # With MLX_QMM_INT8 set, eligible affine qmms run on int8 where the
+        # matrix kernels support it. The result stays close to the float one.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        dtype = mx.float16 if (mx.default_device() == mx.gpu) else mx.float32
+        tests = product(
+            [128, 64, 32],  # group_size
+            [2, 3, 4, 5, 6, 8],  # bits
+            [(64, 128, 256), (100, 96, 512), (257, 200, 1024)],  # M, N, K
+        )
+        for group_size, bits, (M, N, K) in tests:
+            with self.subTest(shape=(M, N, K), group_size=group_size, bits=bits):
+                x = (mx.random.normal(shape=(M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales, biases = mx.quantize(w, group_size, bits)
+
+                ys = []
+                # 1 and 4: a scale per block or per 4 blocks of x, 2: per row
+                for flag in ("0", "1", "2", "4"):
+                    # The switch is read when the op is built
+                    with mlx_tests.scoped_env(MLX_QMM_INT8=flag):
+                        y = mx.quantized_matmul(
+                            x, w_q, scales, biases, True, group_size, bits
+                        )
+                    mx.eval(y)
+                    ys.append(y.astype(mx.float32))
+                for y in ys[1:]:
+                    self.assertEqual(ys[0].shape, y.shape)
+                    err = mx.linalg.norm(y - ys[0]) / mx.linalg.norm(ys[0])
+                    self.assertLess(err.item(), 5e-2)
+
+    def test_qmm_fp8(self):
+        # With MLX_QMM_FP8 set, eligible mxfp4 and mxfp8 qmms run on fp8 where
+        # that is the fastest matmul. The result stays close to the float one.
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        dtype = mx.float16 if (mx.default_device() == mx.gpu) else mx.float32
+        tests = product(
+            ["mxfp4", "mxfp8"],  # mode
+            [(64, 128, 256), (100, 96, 512), (257, 200, 1024)],  # M, N, K
+        )
+        for mode, (M, N, K) in tests:
+            with self.subTest(shape=(M, N, K), mode=mode):
+                bits = 4 if mode == "mxfp4" else 8
+                x = (mx.random.normal(shape=(M, K), key=k1) / K**0.5).astype(dtype)
+                w = (mx.random.normal(shape=(N, K), key=k2) / K**0.5).astype(dtype)
+                w_q, scales = mx.quantize(w, mode=mode)
+
+                ys = []
+                for flag in ("0", "1"):
+                    # The switch is read when the op is built
+                    with mlx_tests.scoped_env(MLX_QMM_FP8=flag):
+                        y = mx.quantized_matmul(
+                            x, w_q, scales, None, True, 32, bits, mode
+                        )
+                    mx.eval(y)
+                    ys.append(y.astype(mx.float32))
+                self.assertEqual(ys[0].shape, ys[1].shape)
+                err = mx.linalg.norm(ys[1] - ys[0]) / mx.linalg.norm(ys[0])
+                self.assertLess(err.item(), 5e-2)
+
     def test_qmm_non_transposed(self):
         # The non-transposed matmul (w is [K, N]) is reachable mainly from the
         # vjp of a quantized linear layer, so it gets much less coverage than

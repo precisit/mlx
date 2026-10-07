@@ -4960,11 +4960,19 @@ array quantized_matmul(
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
+  int compute_8bit = 0;
+  if (transpose && qmode == QuantizationMode::Affine) {
+    compute_8bit = env::qmm_int8();
+  } else if (
+      transpose &&
+      (qmode == QuantizationMode::Mxfp4 || qmode == QuantizationMode::Mxfp8)) {
+    compute_8bit = env::qmm_fp8() ? 8 : 0;
+  }
   return array(
       std::move(out_shape),
       dtype,
       std::make_shared<QuantizedMatmul>(
-          to_stream(s), group_size, bits, qmode, transpose),
+          to_stream(s), group_size, bits, qmode, transpose, compute_8bit),
       std::move(inputs));
 }
 
