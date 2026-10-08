@@ -1094,8 +1094,9 @@ void qmm_nax_fp8(
   int bk = 64;
   int M_pad = ((M + bm - 1) / bm) * bm;
 
-  // The kernel for outputs with whole tiles only has no test on its stores
-  bool aligned = (M % bm == 0) && (N % bn == 0);
+  // Whole tiles of rows run the kernel without a test on its stores, a last
+  // partial tile of rows or a partial tile in N takes the guarded kernel
+  int M_whole = (N % bn == 0) ? (M / bm) * bm : 0;
 
   auto& compute_encoder = metal::get_command_encoder(s);
   auto make_temporary = [&compute_encoder](Shape shape, Dtype dtype) {
@@ -1130,7 +1131,7 @@ void qmm_nax_fp8(
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
-  {
+  auto matmul = [&](bool aligned, int row, int rows) {
     std::string kname;
     concatenate(
         kname,
@@ -1145,15 +1146,22 @@ void qmm_nax_fp8(
     compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(w, 0);
     compute_encoder.set_input_array(scales, 1);
-    compute_encoder.set_input_array(x8, 2);
-    compute_encoder.set_input_array(x_scale, 3);
-    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_input_array(x8, 2, int64_t(row) * K);
+    compute_encoder.set_input_array(
+        x_scale, 3, int64_t(row) * x_scale.itemsize());
+    compute_encoder.set_output_array(out, 4, int64_t(row) * N * out.itemsize());
     compute_encoder.set_bytes(K, 5);
     compute_encoder.set_bytes(N, 6);
-    compute_encoder.set_bytes(M, 7);
+    compute_encoder.set_bytes(rows, 7);
     MTL::Size group_dims(32, wn, wm);
-    MTL::Size grid_dims((N + bn - 1) / bn, M_pad / bm, 1);
+    MTL::Size grid_dims((N + bn - 1) / bn, (rows + bm - 1) / bm, 1);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  };
+  if (M_whole > 0) {
+    matmul(true, 0, M_whole);
+  }
+  if (M_whole < M) {
+    matmul(false, M_whole, M - M_whole);
   }
 }
 

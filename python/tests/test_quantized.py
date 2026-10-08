@@ -478,7 +478,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
         dtype = mx.float16 if (mx.default_device() == mx.gpu) else mx.float32
         tests = product(
             ["mxfp4", "mxfp8"],  # mode
-            [(64, 128, 256), (100, 96, 512), (257, 200, 1024)],  # M, N, K
+            [(64, 128, 256), (100, 128, 512), (257, 200, 1024)],  # M, N, K
         )
         for mode, (M, N, K) in tests:
             with self.subTest(shape=(M, N, K), mode=mode):
