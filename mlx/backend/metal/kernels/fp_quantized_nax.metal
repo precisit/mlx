@@ -6,6 +6,7 @@
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "mlx/backend/metal/kernels/fp_quantized_nax.h"
+#include "mlx/backend/metal/kernels/fp_quantized_nax_i8.h"
 
 
 #define instantiate_quantized_batched(mode, name, type, bm, bn, bk, wm, wn, batched, group_size, bits) \
@@ -120,3 +121,7 @@ instantiate_quantized_types(bfloat16_t)
 instantiate_quantized_types(float16_t)
 instantiate_quantized_qmm_hgs(bfloat16_t)
     // clang-format on
+
+// int8-activation x NVFP4 sorted gather (Precisit, modelopt-to-mlx A8 arm)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2)

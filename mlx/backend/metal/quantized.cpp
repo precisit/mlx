@@ -1,5 +1,7 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <cstdlib>
+
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -2196,6 +2198,62 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = x.shape(-2);
   int N = out.shape(-1);
   int B = out.size() / M / N;
+
+  // Route override for gates and readings (stage2/A8-KERNEL.md K-G4): MLX_GATHER_QMM_I8_ROUTE =
+  // auto (default) | vector (every shape through the int8 vector kernel) | fallback | nax.
+  static const std::string route = [] {
+    const char* v = std::getenv("MLX_GATHER_QMM_I8_ROUTE");
+    return std::string(v ? v : "auto");
+  }();
+  if (route != "auto" && route != "vector" && route != "fallback" && route != "nax") {
+    throw std::invalid_argument("[gather_qmm_i8] MLX_GATHER_QMM_I8_ROUTE must be auto|vector|fallback|nax");
+  }
+  // Sorted, one row per (token, expert) assignment, many assignments: the prefill shape.
+  if (route != "vector" && right_sorted_ && M == 1 && B >= 16) {
+    int E = w.size() / w.shape(-1) / w.shape(-2);
+    int rows = B;   // x is [rows, 1, K] here (one row per assignment)
+    const bool nax_ok = metal::is_nax_available() && K % 64 == 0 && N % 64 == 0 && x.size() / K == rows;
+    if (route == "nax" && !nax_ok) {
+      throw std::runtime_error("[gather_qmm_i8] route nax requested but not available for this call");
+    }
+    if (nax_ok && route != "fallback") {
+      // NAX: int8 x int8 -> int32 per NVFP4 block, fp32 rescale and accumulation (fp_quantized_nax_i8.h)
+      array offsets = gather_mm_offsets(rhs_indices, E, rows, d, s);
+      int bm = (rows / E < 64) ? 32 : 64;
+      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2";
+      auto kernel = d.get_kernel(kname);
+      auto& enc = metal::get_command_encoder(s);
+      enc.set_compute_pipeline_state(kernel);
+      enc.set_input_array(x, 0);
+      enc.set_input_array(xs, 1);
+      enc.set_input_array(w, 2);
+      enc.set_input_array(scales, 3);
+      enc.set_input_array(offsets, 4);
+      enc.set_output_array(out, 5);
+      enc.set_bytes(rows, 6);
+      enc.set_bytes(N, 7);
+      enc.set_bytes(K, 8);
+      enc.set_bytes(E, 9);
+      MTL::Size group_dims(32, 2, 2);
+      MTL::Size grid_dims(N / 64, std::min(rows, (rows + bm - 1) / bm + E - 1), 1);
+      enc.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+    // Elsewhere: the stock fp32 matrix path on the exact int8 values (2*e2m1 x e4m3 and |x_q| <= 127 are
+    // exact in fp32/half, so every product is exact), then the per-row scale.
+    array xf(x.shape(), float32, nullptr, {});
+    copy_gpu(x, xf, CopyType::General, s);
+    gather_qmm_rhs(xf, w, scales, std::nullopt, std::nullopt, rhs_indices, out, true, 16, 4, rows, N, K, d, s, "nvfp4");
+    auto kernel = d.get_kernel("fp_i8_scale_rows");
+    auto& enc = metal::get_command_encoder(s);
+    enc.add_temporary(xf);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_output_array(out, 0);
+    enc.set_input_array(xs, 1);
+    enc.set_bytes(N, 2);
+    enc.dispatch_threads(MTL::Size(N, rows, 1), MTL::Size(std::min(N, 256), 1, 1));
+    return;
+  }
 
   auto kernel = d.get_kernel("fp_gather_qmv_i8");
   auto& enc = metal::get_command_encoder(s);

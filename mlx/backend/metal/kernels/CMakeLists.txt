@@ -142,7 +142,7 @@ if(NOT MLX_METAL_JIT)
     reduction/reduce_col.h
     reduction/reduce_row.h)
   build_kernel(quantized quantized.h quantized_utils.h ${STEEL_HEADERS})
-  build_kernel(fp_quantized fp4.h fp8.h fp_quantized.h quantized_utils.h
+  build_kernel(fp_quantized fp4.h fp8.h fp_quantized.h fp_quantized_i8.h fp_quantized_i8_utils.h quantized_utils.h
                ${STEEL_HEADERS})
   build_kernel(scan scan.h)
   build_kernel(softmax softmax.h)
@@ -180,7 +180,7 @@ if(NOT MLX_METAL_JIT)
                  gated_delta_nax_ops.h ${STEEL_NAX_HEADERS})
     build_kernel(gated_delta_update_nax_vjp gated_delta_update_nax_vjp.h
                  gated_delta_nax_ops.h ${STEEL_NAX_HEADERS})
-    build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h
+    build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h fp_quantized_nax_i8.h fp_quantized_i8_utils.h
                  ${STEEL_NAX_HEADERS})
 
     build_kernel(steel/attn/kernels/steel_attention_nax

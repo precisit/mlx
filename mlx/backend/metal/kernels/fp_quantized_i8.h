@@ -9,8 +9,7 @@
 
 #pragma once
 
-// 2 * e2m1(code) for the 3 magnitude bits; bit 3 is the sign.
-constant constexpr int8_t i8_e2m1_x2[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+#include "mlx/backend/metal/kernels/fp_quantized_i8_utils.h"
 
 METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t* wb) {
   // wb: the 8 bytes of one 16-value block, element 2j in the low nibble of byte j (fp_quantize order).
@@ -18,18 +17,9 @@ METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t*
 #pragma clang loop unroll(full)
   for (int j = 0; j < 8; j++) {
     uint8_t b = wb[j];
-    uint8_t lo = b & 0x0f, hi = b >> 4;
-    int vlo = i8_e2m1_x2[lo & 7];
-    int vhi = i8_e2m1_x2[hi & 7];
-    vlo = (lo & 8) ? -vlo : vlo;
-    vhi = (hi & 8) ? -vhi : vhi;
-    acc += int(xq[2 * j]) * vlo + int(xq[2 * j + 1]) * vhi;
+    acc += int(xq[2 * j]) * i8_e2m1_x2(b & 0x0f) + int(xq[2 * j + 1]) * i8_e2m1_x2(b >> 4);
   }
   return acc;
-}
-
-METAL_FUNC float i8_e4m3_to_float(uint8_t s) {
-  return float(*(thread fp8_e4m3*)(&s));
 }
 
 // One threadgroup = 2 simdgroups x 4 output rows each (8 rows, as the stock qmv), one x row (tid.x), one
@@ -118,4 +108,13 @@ METAL_FUNC float i8_e4m3_to_float(uint8_t s) {
       y[out_row + r] = v * xs * 0.5f;
     }
   }
+}
+
+// y[r, :] *= x_scale[r] (the non-NAX sorted fallback: stock fp32 matmul on the exact int8 values, then this).
+[[kernel]] void fp_i8_scale_rows(
+    device float* y [[buffer(0)]],
+    const device float* x_scale [[buffer(1)]],
+    const constant int& N [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  y[size_t(gid.y) * N + gid.x] *= x_scale[gid.y];
 }
