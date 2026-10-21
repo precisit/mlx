@@ -3932,6 +3932,17 @@ std::vector<Shape> GatherQMM::output_shapes(const std::vector<array>& inputs) {
   return {out_shape};
 }
 
+bool GatherQMMI8::is_equivalent(const Primitive& other) const {
+  return right_sorted_ == static_cast<const GatherQMMI8&>(other).right_sorted_;
+}
+
+std::vector<Shape> GatherQMMI8::output_shapes(const std::vector<array>& inputs) {
+  auto out_shape = inputs[inputs.size() - 2].shape();
+  out_shape.push_back(inputs[0].shape(-2));
+  out_shape.push_back(inputs[2].shape(-2));
+  return {out_shape};
+}
+
 bool GatherQQMM::is_equivalent(const Primitive& other) const {
   const GatherQQMM& qm_other = static_cast<const GatherQQMM&>(other);
   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&

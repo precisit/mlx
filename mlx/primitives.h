@@ -1738,6 +1738,25 @@ class GatherQMM : public UnaryPrimitive {
   bool right_sorted_;
 };
 
+class GatherQMMI8 : public UnaryPrimitive {
+ public:
+  explicit GatherQMMI8(Stream stream, bool right_sorted = false)
+      : UnaryPrimitive(stream), right_sorted_(right_sorted) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_NAME(GatherQMMI8)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(right_sorted_);
+  }
+
+ private:
+  bool right_sorted_;
+};
+
 class GatherQQMM : public UnaryPrimitive {
  public:
   explicit GatherQQMM(

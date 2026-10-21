@@ -5026,6 +5026,28 @@ void init_ops(nb::module_& m) {
               after gathering using ``lhs_indices`` and ``rhs_indices``.
       )pbdoc");
   m.def(
+      "gather_qmm_i8",
+      &mx::gather_qmm_i8,
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      "lhs_indices"_a = nb::none(),
+      "rhs_indices"_a = nb::none(),
+      nb::kw_only(),
+      "sorted_indices"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def gather_qmm_i8(x_q: array, x_scale: array, w: array, scales: array, /, lhs_indices: array | None = None, rhs_indices: array | None = None, *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        int8-activation x NVFP4-weight gathered matmul, ``x @ w.T`` (Precisit fork, modelopt-to-mlx A8 arm).
+
+        ``x_q`` is int8 with one float32 scale per row (``x_scale``, shape ``x_q.shape[:-1] + [1]``);
+        ``w`` and ``scales`` are nvfp4 (group 16) without a global scale, which the caller applies.
+        Every 16-wide block partial is an exact integer; only the E4M3 block scaling and the fp32
+        accumulation round. Returns float32. GPU only.
+      )pbdoc");
+  m.def(
       "gather_qqmm",
       &mx::gather_qqmm,
       nb::arg(),

@@ -1382,6 +1382,10 @@ void QQMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void GatherQMMI8::eval_cpu(const std::vector<array>& inputs, array& out) {
+  throw std::runtime_error("[gather_qmm_i8] GPU only.");
+}
+
 void GatherQQMM::eval_cpu(const std::vector<array>& inputs, array& out) {
   throw std::runtime_error("[GatherQQMM] NYI");
 }

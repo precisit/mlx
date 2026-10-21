@@ -5,6 +5,7 @@
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/fp_quantized.h"
+#include "mlx/backend/metal/kernels/fp_quantized_i8.h"
 
 #define instantiate_quantized(mode, name, type, group_size, bits) \
   instantiate_kernel( \

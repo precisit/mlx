@@ -2172,6 +2172,50 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       mode);
 }
 
+void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
+  // inputs: x_q int8 [..., M, K], x_scale f32 [..., M, 1], w uint32 [E, N, K/8], scales uint8 [E, N, K/16],
+  // lhs_indices, rhs_indices. One vector kernel for every shape for now (fp_quantized_i8.h): every
+  // output is sum_b e4m3(S) * (exact int32 block partial), times x_scale / 2.
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], d, s);
+  array xs = ensure_row_contiguous(inputs[1], d, s);
+  array w = ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[3], d, s);
+  const array& lhs_indices = inputs[4];
+  const array& rhs_indices = inputs[5];
+  if (!x.flags().row_contiguous || !xs.flags().row_contiguous) {
+    x = contiguous_copy_gpu(x, s);
+    xs = contiguous_copy_gpu(xs, s);
+    metal::get_command_encoder(s).add_temporaries({x, xs});
+  }
+
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+  int B = out.size() / M / N;
+
+  auto kernel = d.get_kernel("fp_gather_qmv_i8");
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(w, 0);
+  enc.set_input_array(scales, 1);
+  enc.set_input_array(x, 2);
+  enc.set_input_array(xs, 3);
+  enc.set_input_array(lhs_indices, 4);
+  enc.set_input_array(rhs_indices, 5);
+  enc.set_output_array(out, 6);
+  enc.set_bytes(K, 7);
+  enc.set_bytes(N, 8);
+  int c = add_strides_and_shapes(enc, false, x, w, scales, std::nullopt, 9);
+  add_gather_strides_and_shapes(enc, lhs_indices, rhs_indices, c);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(M, (N + 7) / 8, B);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void GatherQQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);

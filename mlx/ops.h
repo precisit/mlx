@@ -1685,6 +1685,19 @@ MLX_API array gather_qqmm(
     bool sorted_indices = false,
     StreamOrDevice s = {});
 
+/** int8-activation x NVFP4-weight gathered matmul (x @ w.T). ``x_q`` is int8 with one float32 scale
+ * per row (``x_scale``, shape ``x.shape[:-1] + [1]``); ``w``/``scales`` are nvfp4 (group 16) without a
+ * global scale, which the caller applies. Returns float32. GPU only. */
+MLX_API array gather_qmm_i8(
+    const array& x_q,
+    const array& x_scale,
+    const array& w,
+    const array& scales,
+    std::optional<array> lhs_indices = std::nullopt,
+    std::optional<array> rhs_indices = std::nullopt,
+    bool sorted_indices = false,
+    StreamOrDevice s = {});
+
 /** Returns a contraction of a and b over multiple dimensions. */
 MLX_API array tensordot(
     const array& a,

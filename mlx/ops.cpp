@@ -5826,6 +5826,50 @@ array gather_qmm(
       std::move(inputs));
 }
 
+array gather_qmm_i8(
+    const array& x_q,
+    const array& x_scale,
+    const array& w,
+    const array& scales,
+    std::optional<array> lhs_indices_ /* = std::nullopt */,
+    std::optional<array> rhs_indices_ /* = std::nullopt */,
+    bool sorted_indices /* = false */,
+    StreamOrDevice s /* = {} */) {
+  if (x_q.dtype() != int8) {
+    throw std::invalid_argument("[gather_qmm_i8] x_q must be int8.");
+  }
+  if (x_scale.dtype() != float32 || x_scale.ndim() != x_q.ndim() ||
+      x_scale.shape(-1) != 1 ||
+      !std::equal(x_q.shape().begin(), x_q.shape().end() - 1, x_scale.shape().begin())) {
+    throw std::invalid_argument(
+        "[gather_qmm_i8] x_scale must be float32 with shape x_q.shape[:-1] + [1].");
+  }
+  if (w.dtype() != uint32 || scales.dtype() != uint8 || w.ndim() < 3) {
+    throw std::invalid_argument("[gather_qmm_i8] w must be nvfp4 (uint32 packed, uint8 e4m3 scales), batched by expert.");
+  }
+  int K = x_q.shape(-1);
+  if (K % 16 != 0 || w.shape(-1) * 8 != K || scales.shape(-1) * 16 != K ||
+      scales.shape(-2) != w.shape(-2)) {
+    std::ostringstream msg;
+    msg << "[gather_qmm_i8] shape mismatch: x_q " << x_q.shape() << ", w " << w.shape() << ", scales " << scales.shape();
+    throw std::invalid_argument(msg.str());
+  }
+  if (to_stream(s).device != Device::gpu) {
+    throw std::invalid_argument("[gather_qmm_i8] GPU only.");
+  }
+  array lhs_indices = indices_or_default("[gather_qmm_i8]", lhs_indices_, x_q, s);
+  array rhs_indices = indices_or_default("[gather_qmm_i8]", rhs_indices_, w, s);
+  std::tie(lhs_indices, rhs_indices) = broadcast_arrays(lhs_indices, rhs_indices, s);
+  auto out_shape = lhs_indices.shape();
+  out_shape.push_back(x_q.shape(-2));
+  out_shape.push_back(w.shape(-2));
+  return array(
+      std::move(out_shape),
+      float32,
+      std::make_shared<GatherQMMI8>(to_stream(s), sorted_indices && !lhs_indices_),
+      {x_q, x_scale, w, scales, std::move(lhs_indices), std::move(rhs_indices)});
+}
+
 array gather_qqmm(
     const array& x,
     const array& w,
