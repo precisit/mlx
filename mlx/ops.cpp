@@ -5857,6 +5857,16 @@ array gather_qmm_i8(
   if (to_stream(s).device != Device::gpu) {
     throw std::invalid_argument("[gather_qmm_i8] GPU only.");
   }
+  // Sorted, one row per (token, expert) assignment, many assignments: the prefill shape. Until the NAX
+  // int8 x int8 -> int32 matrix kernel exists, this route runs the stock fp32 matrix path on the exact
+  // int8 values (2*e2m1 x e4m3 and |x_q| <= 127 are exact in fp32/tf32/half, so every product is exact)
+  // and applies x_scale per row: the defining formula up to fp32 accumulation order.
+  if (sorted_indices && !lhs_indices_ && rhs_indices_ && x_q.shape(-2) == 1 &&
+      rhs_indices_->size() >= 16) {
+    auto y = gather_qmm(astype(x_q, float32, s), w, scales, std::nullopt, std::nullopt, rhs_indices_,
+                        /* transpose */ true, 16, 4, "nvfp4", std::nullopt, /* sorted */ true, s);
+    return multiply(y, x_scale, s);   // stock dequantization already yields e2m1 x e4m3 (no factor 2)
+  }
   array lhs_indices = indices_or_default("[gather_qmm_i8]", lhs_indices_, x_q, s);
   array rhs_indices = indices_or_default("[gather_qmm_i8]", rhs_indices_, w, s);
   std::tie(lhs_indices, rhs_indices) = broadcast_arrays(lhs_indices, rhs_indices, s);
