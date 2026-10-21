@@ -1,9 +1,15 @@
 """K-G1..K-G3 for mx.gather_qmm_i8 (modelopt-to-mlx stage2/A8-KERNEL.md). Run with the fork build:
-    python -I precisit/test_gather_qmm_i8.py
+    MLX_ENABLE_TF32=0 python -I precisit/test_gather_qmm_i8.py
 """
-import json, sys
+import json, os, sys
 import numpy as np
 import mlx.core as mx
+
+# The a8-ref reference is stock fp32-x gather_qmm, which MLX runs in TF32 on NAX (M5-class) hosts unless
+# MLX_ENABLE_TF32=0; the reference is then not fp32 and K-G3 is meaningless (modelopt-to-mlx amendment 16b, R23).
+# Required on every host, so no caller can forget it.
+if os.environ.get("MLX_ENABLE_TF32") != "0":
+    raise SystemExit("STOP: set MLX_ENABLE_TF32=0 (the fp32 reference is TF32 on NAX hosts otherwise)")
 
 E2M1_X2 = np.array([0, 1, 2, 3, 4, 6, 8, 12], np.int64)
 

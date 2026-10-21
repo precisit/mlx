@@ -1,5 +1,5 @@
 """K-G4 (modelopt-to-mlx stage2/A8-KERNEL.md): the same seeded operands through each route of mx.gather_qmm_i8.
-Run once per route (the route is read once per process), then compare:
+Run once per route (the route is read once per process), with MLX_ENABLE_TF32=0, then compare:
     MLX_GATHER_QMM_I8_ROUTE=nax      python -I precisit/kg4_routes.py dump OUT/nax.npz
     MLX_GATHER_QMM_I8_ROUTE=vector   python -I precisit/kg4_routes.py dump OUT/vector.npz
     MLX_GATHER_QMM_I8_ROUTE=fallback python -I precisit/kg4_routes.py dump OUT/fallback.npz
@@ -9,6 +9,12 @@ Also writes the a8-ref (stock gather_qmm on the dequantized int8 input) and an e
 import json, os, sys
 import numpy as np
 import mlx.core as mx
+
+# The a8-ref reference is stock fp32-x gather_qmm, which MLX runs in TF32 on NAX (M5-class) hosts unless
+# MLX_ENABLE_TF32=0; the reference is then not fp32 and K-G3 is meaningless (modelopt-to-mlx amendment 16b, R23).
+# Required on every host, so no caller can forget it.
+if sys.argv[1:2] != ["compare"] and os.environ.get("MLX_ENABLE_TF32") != "0":
+    raise SystemExit("STOP: set MLX_ENABLE_TF32=0 (the fp32 reference is TF32 on NAX hosts otherwise)")
 
 E2M1_X2 = np.array([0, 1, 2, 3, 4, 6, 8, 12], np.int64)
 
