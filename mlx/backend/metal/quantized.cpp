@@ -2220,7 +2220,18 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
       // NAX: int8 x int8 -> int32 per NVFP4 block, fp32 rescale and accumulation (fp_quantized_nax_i8.h)
       array offsets = gather_mm_offsets(rhs_indices, E, rows, d, s);
       int bm = (rows / E < 64) ? 32 : 64;
-      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2";
+      // Speed diagnostic (branch nvfp4-gather-qmm-i8-diag): MLX_GATHER_QMM_I8_NAX_DIAG selects a kernel variant
+      // (fp_quantized_nax_i8.h); 4 and 8 have wrong numerics on purpose.
+      static const int diag = [] {
+        const char* v = std::getenv("MLX_GATHER_QMM_I8_NAX_DIAG");
+        int d = v ? std::atoi(v) : 0;
+        if (d != 0 && d != 1 && d != 2 && d != 3 && d != 4 && d != 8 && d != 12) {
+          throw std::invalid_argument("[gather_qmm_i8] MLX_GATHER_QMM_I8_NAX_DIAG must be 0|1|2|3|4|8|12");
+        }
+        return d;
+      }();
+      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2_d" +
+          std::to_string(diag);
       auto kernel = d.get_kernel(kname);
       auto& enc = metal::get_command_encoder(s);
       enc.set_compute_pipeline_state(kernel);
