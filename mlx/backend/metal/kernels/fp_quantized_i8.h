@@ -11,15 +11,27 @@
 
 #include "mlx/backend/metal/kernels/fp_quantized_i8_utils.h"
 
-METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t* wb) {
-  // wb: the 8 bytes of one 16-value block, element 2j in the low nibble of byte j (fp_quantize order).
-  int acc = 0;
+// The exact block partial p = sum_{k in block} x_q[k] * 2*e2m1(w[k]) for one 16-value block (its 8 weight bytes as
+// one uint2), from x_q held in float. 2*e2m1 is built as an fp16 bit pattern: code s|e|m -> bits s<<15 | e<<10 |
+// m<<9 is e2m1 * 2^-14 (e = 0 gives the fp16 subnormal m * 2^-15), so half(bits) * 2^15 = 2*e2m1 exactly. Every
+// product x_q * e2m1 * 2^-14 and every partial sum is an integer multiple of 2^-15 below 2^24 of them, so the fp32
+// dot is exact in any order, and the final * 2^15 gives the same integer as an int32 sum (speed lane step 2.3:
+// on M5 Max this runs at the stock bf16 vector kernel's speed, against 2.3-4.5x for the integer form).
+METAL_FUNC float i8_nvfp4_block_dot(const thread float* xf, uint2 wv) {
+  float acc = 0.0f;
 #pragma clang loop unroll(full)
-  for (int j = 0; j < 8; j++) {
-    uint8_t b = wb[j];
-    acc += int(xq[2 * j]) * i8_e2m1_x2(b & 0x0f) + int(xq[2 * j + 1]) * i8_e2m1_x2(b >> 4);
+  for (int j = 0; j < 4; j++) {
+    const uint t = i8_spread_nibbles((j < 2 ? wv.x : wv.y) >> (16 * (j & 1)) & 0xFFFFu);
+    const uint u0 = (t & 0xFFu) | ((t & 0xFF00u) << 8);
+    const uint u1 = ((t >> 16) & 0xFFu) | ((t >> 8) & 0xFF0000u);
+    const half2 h0 = as_type<half2>(((u0 & 0x00080008u) << 12) | ((u0 & 0x00070007u) << 9));
+    const half2 h1 = as_type<half2>(((u1 & 0x00080008u) << 12) | ((u1 & 0x00070007u) << 9));
+    acc = fma(xf[4 * j + 0], float(h0.x), acc);
+    acc = fma(xf[4 * j + 1], float(h0.y), acc);
+    acc = fma(xf[4 * j + 2], float(h1.x), acc);
+    acc = fma(xf[4 * j + 3], float(h1.y), acc);
   }
-  return acc;
+  return acc * 32768.0f;
 }
 
 // One threadgroup = 2 simdgroups x 4 output rows each (8 rows, as the stock qmv), one x row (tid.x), one
@@ -86,18 +98,24 @@ METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t*
   const int n_blocks = K / 16;
   const int row_bytes = K / 2;
   float result[rows_per_simdgroup] = {0};
-  thread int8_t xq[16];
+  thread float xf[16];
   for (int b = simd_lid; b < n_blocks; b += SIMD_SIZE) {
+    // 16 x values as four 4-byte loads (row starts are 16-byte aligned: K % 16 == 0 and the host checks x's offset)
+    const device char4* xv = (const device char4*)(xr + b * 16);
 #pragma clang loop unroll(full)
-    for (int j = 0; j < 16; j++) {
-      xq[j] = xr[b * 16 + j];
+    for (int j = 0; j < 4; j++) {
+      const char4 c = xv[j];
+#pragma clang loop unroll(full)
+      for (int e = 0; e < 4; e++) {
+        xf[4 * j + e] = float(c[e]);
+      }
     }
 #pragma clang loop unroll(full)
     for (int r = 0; r < rows_per_simdgroup; r++) {
       const int n = out_row + r;
       if (n < N) {
-        int p = i8_nvfp4_block_dot(xq, wbytes + int64_t(n) * row_bytes + b * 8);
-        result[r] += float(p) * i8_e4m3_to_float(scales[int64_t(n) * n_blocks + b]);
+        const float p = i8_nvfp4_block_dot(xf, *(const device uint2*)(wbytes + int64_t(n) * row_bytes + b * 8));
+        result[r] += p * i8_e4m3_to_float(scales[int64_t(n) * n_blocks + b]);
       }
     }
   }

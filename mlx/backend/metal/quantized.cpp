@@ -2220,6 +2220,9 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
       // NAX: int8 x int8 -> int32 per NVFP4 block, fp32 rescale and accumulation (fp_quantized_nax_i8.h)
       array offsets = gather_mm_offsets(rhs_indices, E, rows, d, s);
       int bm = (rows / E < 64) ? 32 : 64;
+      if (w.offset() % 16 != 0) {
+        throw std::runtime_error("[gather_qmm_i8] NAX kernel needs 16-byte aligned weights");
+      }
       std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2";
       auto kernel = d.get_kernel(kname);
       auto& enc = metal::get_command_encoder(s);
@@ -2255,6 +2258,9 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
+  if (w.offset() % 8 != 0 || x.offset() % 16 != 0) {
+    throw std::runtime_error("[gather_qmm_i8] vector kernel needs 8-byte aligned weights and 16-byte aligned x");
+  }
   auto kernel = d.get_kernel("fp_gather_qmv_i8");
   auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);

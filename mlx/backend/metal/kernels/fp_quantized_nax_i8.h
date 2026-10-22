@@ -10,12 +10,13 @@
 // nvfp4-gather-qmm-i8-diag, measured bit-identical there): weights unpack through a 16-entry table, and block
 // scales are staged [NB][BN] so that each fragment column group reads its four scales as one float4. Both
 // change only how values are fetched: every product and every addition is the same, in the same order.
+// Speed lane step 2.3 (diagnostic branch nvfp4-gather-qmm-i8-unpack-diag, variant 2, measured byte-identical there):
+// each staging thread loads 32 weights as one uint4, unpacks them through a 256-entry byte table (one read per byte
+// gives both values) and stores them as two uint4. The staged int8 values are the same.
 
 #pragma once
 
 #include "mlx/backend/metal/kernels/fp_quantized_i8_utils.h"
-
-constant constexpr int8_t i8_e2m1_x2_lut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
 template <int BM, int BN, int BK, int WM, int WN>
 [[kernel]] void fp_gather_qmm_rhs_nax_i8(
@@ -37,9 +38,10 @@ template <int BM, int BN, int BK, int WM, int WN>
   constexpr int NB = BK / 16;                             // NVFP4 blocks per K tile
   constexpr int TPR = (WM * WN * SIMD_SIZE) / BN;         // staging threads per weight row
   constexpr int VPT = BK / TPR;                           // weight values staged per thread
-  static_assert(TPR >= 1 && BK % TPR == 0 && VPT % 16 == 0, "a thread stages whole NVFP4 blocks");
+  static_assert(TPR >= 1 && BK % TPR == 0 && VPT % 32 == 0, "a thread stages whole 16-byte weight chunks");
+  static_assert(BK_padded % 16 == 0, "16-byte aligned weight rows in threadgroup memory");
 
-  threadgroup int8_t Ws[BN * BK_padded];
+  alignas(16) threadgroup int8_t Ws[BN * BK_padded];
   alignas(16) threadgroup float Ss[NB * BN];   // [NB][BN]: block kb's scales for the tile's BN columns
 
   int y_row;
@@ -74,12 +76,20 @@ template <int BM, int BN, int BK, int WM, int WN>
   for (int k = 0; k < K; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-      const device uint8_t* p = wrow + (k + kl) / 2;
+      // 32 weights = 16 bytes = one uint4 (16-byte aligned: K % 64 == 0, k and kl multiples of 32, host checks w)
+      const device uint4* p = (const device uint4*)(wrow + (k + kl) / 2);
       STEEL_PRAGMA_UNROLL
-      for (int j = 0; j < VPT / 2; j++) {
-        const uint8_t b = p[j];
-        wdst[2 * j] = i8_e2m1_x2_lut[b & 0x0f];
-        wdst[2 * j + 1] = i8_e2m1_x2_lut[b >> 4];
+      for (int c = 0; c < VPT / 32; c++) {
+        const uint4 wv = p[c];
+        uint o[8];
+        STEEL_PRAGMA_UNROLL
+        for (int i = 0; i < 4; i++) {
+          o[2 * i] = uint(i8_e2m1_x2_lut2[wv[i] & 0xFF]) | (uint(i8_e2m1_x2_lut2[(wv[i] >> 8) & 0xFF]) << 16);
+          o[2 * i + 1] = uint(i8_e2m1_x2_lut2[(wv[i] >> 16) & 0xFF]) | (uint(i8_e2m1_x2_lut2[wv[i] >> 24]) << 16);
+        }
+        threadgroup uint4* d4 = (threadgroup uint4*)(wdst + 32 * c);
+        d4[0] = uint4(o[0], o[1], o[2], o[3]);
+        d4[1] = uint4(o[4], o[5], o[6], o[7]);
       }
       STEEL_PRAGMA_UNROLL
       for (int b = 0; b < VPT / 16; b++) {
