@@ -259,3 +259,10 @@ instantiate_quantized_types(bfloat16_t)
 instantiate_quantized_types(float16_t)
 instantiate_quantized_qmm_hgs(bfloat16_t)
     // clang-format on
+
+// int8-activation x NVFP4 vector kernel (Precisit, modelopt-to-mlx A8 arm), by unpack variant (speed lane step 2.3)
+instantiate_kernel("fp_gather_qmv_i8_u0", fp_gather_qmv_i8, 0)
+instantiate_kernel("fp_gather_qmv_i8_u1", fp_gather_qmv_i8, 1)
+instantiate_kernel("fp_gather_qmv_i8_u2", fp_gather_qmv_i8, 2)
+instantiate_kernel("fp_gather_qmv_i8_u3", fp_gather_qmv_i8, 3)
+instantiate_kernel("fp_gather_qmv_i8_u8", fp_gather_qmv_i8, 8)

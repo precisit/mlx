@@ -17,7 +17,11 @@
 
 constant constexpr int8_t i8_e2m1_x2_lut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
-template <int BM, int BN, int BK, int WM, int WN>
+// Unpack variants U (speed lane step 2.3; MLX_GATHER_QMM_I8_NAX_UNPACK) change only how the int8 weight tile is
+// staged: 0 as scored (one byte load and two 16-entry table reads per weight byte, byte stores); 1 one 16-byte load
+// per 32 weights, SWAR decode, 16-byte stores; 2 as 1 with a 256-entry byte table; 8 as 1 without the decode
+// (timing bound only, wrong numerics). The staged int8 values, and so every product and sum, are the same in 0-2.
+template <int BM, int BN, int BK, int WM, int WN, int U>
 [[kernel]] void fp_gather_qmm_rhs_nax_i8(
     const device int8_t* x [[buffer(0)]],
     const device float* x_scale [[buffer(1)]],
@@ -38,8 +42,9 @@ template <int BM, int BN, int BK, int WM, int WN>
   constexpr int TPR = (WM * WN * SIMD_SIZE) / BN;         // staging threads per weight row
   constexpr int VPT = BK / TPR;                           // weight values staged per thread
   static_assert(TPR >= 1 && BK % TPR == 0 && VPT % 16 == 0, "a thread stages whole NVFP4 blocks");
+  static_assert(U == 0 || (VPT % 32 == 0 && BK_padded % 16 == 0), "wide staging: whole 16-byte loads and stores");
 
-  threadgroup int8_t Ws[BN * BK_padded];
+  alignas(16) threadgroup int8_t Ws[BN * BK_padded];
   alignas(16) threadgroup float Ss[NB * BN];   // [NB][BN]: block kb's scales for the tile's BN columns
 
   int y_row;
@@ -75,11 +80,37 @@ template <int BM, int BN, int BK, int WM, int WN>
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
       const device uint8_t* p = wrow + (k + kl) / 2;
-      STEEL_PRAGMA_UNROLL
-      for (int j = 0; j < VPT / 2; j++) {
-        const uint8_t b = p[j];
-        wdst[2 * j] = i8_e2m1_x2_lut[b & 0x0f];
-        wdst[2 * j + 1] = i8_e2m1_x2_lut[b >> 4];
+      if (U == 0) {
+        STEEL_PRAGMA_UNROLL
+        for (int j = 0; j < VPT / 2; j++) {
+          const uint8_t b = p[j];
+          wdst[2 * j] = i8_e2m1_x2_lut[b & 0x0f];
+          wdst[2 * j + 1] = i8_e2m1_x2_lut[b >> 4];
+        }
+      } else {
+        // 32 weights = 16 bytes = one uint4 (16-byte aligned: K % 64 == 0 and k, kl multiples of 32)
+        STEEL_PRAGMA_UNROLL
+        for (int c = 0; c < VPT / 32; c++) {
+          const uint4 wv = ((const device uint4*)p)[c];
+          uint o[8];
+          STEEL_PRAGMA_UNROLL
+          for (int i = 0; i < 4; i++) {
+            if (U == 2) {
+              o[2 * i] = uint(i8_e2m1_x2_lut2[wv[i] & 0xFF]) | (uint(i8_e2m1_x2_lut2[(wv[i] >> 8) & 0xFF]) << 16);
+              o[2 * i + 1] = uint(i8_e2m1_x2_lut2[(wv[i] >> 16) & 0xFF]) | (uint(i8_e2m1_x2_lut2[wv[i] >> 24]) << 16);
+            } else {
+              o[2 * i] = i8_spread_nibbles(wv[i] & 0xFFFF);
+              o[2 * i + 1] = i8_spread_nibbles(wv[i] >> 16);
+              if (U == 1) {
+                o[2 * i] = i8_e2m1_x2_swar(o[2 * i]);
+                o[2 * i + 1] = i8_e2m1_x2_swar(o[2 * i + 1]);
+              }
+            }
+          }
+          threadgroup uint4* d4 = (threadgroup uint4*)(wdst + 32 * c);
+          d4[0] = uint4(o[0], o[1], o[2], o[3]);
+          d4[1] = uint4(o[4], o[5], o[6], o[7]);
+        }
       }
       STEEL_PRAGMA_UNROLL
       for (int b = 0; b < VPT / 16; b++) {

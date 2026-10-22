@@ -2208,6 +2208,20 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (route != "auto" && route != "vector" && route != "fallback" && route != "nax") {
     throw std::invalid_argument("[gather_qmm_i8] MLX_GATHER_QMM_I8_ROUTE must be auto|vector|fallback|nax");
   }
+  // Speed diagnostic (branch nvfp4-gather-qmm-i8-unpack-diag, A8-KERNEL.md step 2.3): weight unpack variant per
+  // kernel; 8 has wrong numerics on purpose (timing bound).
+  auto unpack_env = [](const char* name, std::initializer_list<int> ok) {
+    const char* v = std::getenv(name);
+    int u = v ? std::atoi(v) : 0;
+    for (int o : ok) {
+      if (u == o) {
+        return u;
+      }
+    }
+    throw std::invalid_argument(std::string("[gather_qmm_i8] unsupported ") + name);
+  };
+  static const int nax_unpack = unpack_env("MLX_GATHER_QMM_I8_NAX_UNPACK", {0, 1, 2, 8});
+  static const int qmv_unpack = unpack_env("MLX_GATHER_QMM_I8_QMV_UNPACK", {0, 1, 2, 3, 8});
   // Sorted, one row per (token, expert) assignment, many assignments: the prefill shape.
   if (route != "vector" && right_sorted_ && M == 1 && B >= 16) {
     int E = w.size() / w.shape(-1) / w.shape(-2);
@@ -2220,7 +2234,11 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
       // NAX: int8 x int8 -> int32 per NVFP4 block, fp32 rescale and accumulation (fp_quantized_nax_i8.h)
       array offsets = gather_mm_offsets(rhs_indices, E, rows, d, s);
       int bm = (rows / E < 64) ? 32 : 64;
-      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2";
+      if (nax_unpack != 0 && w.offset() % 16 != 0) {
+        throw std::runtime_error("[gather_qmm_i8] NAX unpack variant needs 16-byte aligned weights");
+      }
+      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2_u" +
+          std::to_string(nax_unpack);
       auto kernel = d.get_kernel(kname);
       auto& enc = metal::get_command_encoder(s);
       enc.set_compute_pipeline_state(kernel);
@@ -2255,7 +2273,10 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  auto kernel = d.get_kernel("fp_gather_qmv_i8");
+  if (qmv_unpack != 0 && (w.offset() % 8 != 0 || x.offset() % 16 != 0)) {
+    throw std::runtime_error("[gather_qmm_i8] vector unpack variant needs aligned x and weights");
+  }
+  auto kernel = d.get_kernel("fp_gather_qmv_i8_u" + std::to_string(qmv_unpack));
   auto& enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
   enc.set_input_array(w, 0);

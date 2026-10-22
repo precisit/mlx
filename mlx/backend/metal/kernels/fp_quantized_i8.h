@@ -22,9 +22,40 @@ METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t*
   return acc;
 }
 
+// Four words of four int8 values 2*e2m1 (elements 0..15 of one block) from its 8 weight bytes, by unpack
+// variant (speed lane step 2.3; MLX_GATHER_QMM_I8_QMV_UNPACK): 1 SWAR integer decode, 2 byte table,
+// 8 no decode (raw codes; a timing bound with wrong numerics).
+template <int U>
+METAL_FUNC void i8_unpack_block(uint2 wv, thread uint* q) {
+  if (U == 2) {
+    q[0] = uint(i8_e2m1_x2_lut2[wv.x & 0xFF]) | (uint(i8_e2m1_x2_lut2[(wv.x >> 8) & 0xFF]) << 16);
+    q[1] = uint(i8_e2m1_x2_lut2[(wv.x >> 16) & 0xFF]) | (uint(i8_e2m1_x2_lut2[wv.x >> 24]) << 16);
+    q[2] = uint(i8_e2m1_x2_lut2[wv.y & 0xFF]) | (uint(i8_e2m1_x2_lut2[(wv.y >> 8) & 0xFF]) << 16);
+    q[3] = uint(i8_e2m1_x2_lut2[(wv.y >> 16) & 0xFF]) | (uint(i8_e2m1_x2_lut2[wv.y >> 24]) << 16);
+  } else {
+    q[0] = i8_spread_nibbles(wv.x & 0xFFFF);
+    q[1] = i8_spread_nibbles(wv.x >> 16);
+    q[2] = i8_spread_nibbles(wv.y & 0xFFFF);
+    q[3] = i8_spread_nibbles(wv.y >> 16);
+    if (U == 1) {
+#pragma clang loop unroll(full)
+      for (int j = 0; j < 4; j++) {
+        q[j] = i8_e2m1_x2_swar(q[j]);
+      }
+    }
+  }
+}
+
 // One threadgroup = 2 simdgroups x 4 output rows each (8 rows, as the stock qmv), one x row (tid.x), one
 // batch element (tid.z). Each thread walks the K blocks simd_lid, simd_lid + 32, ... so every thread's
 // per-block partial is a whole NVFP4 block.
+//
+// Unpack variants U (speed lane step 2.3) change only how the exact integer block partial p is formed; the
+// fp32 work (p * e4m3 scale, the accumulation order, simd_sum, the final scale) is the same in all of them.
+// 0: scalar unpack (as scored). 1: one 8-byte weight load, SWAR decode, integer dot. 2: as 1 with a byte
+// table. 3: fp16 bit construction (2*e2m1 = half(bits) * 2^15, exact) and an fp32 dot, every product and
+// partial sum an exact multiple of 2^-15 below 2^24 ulps. 8: as 1 without the decode (timing bound only).
+template <int U>
 [[kernel]] void fp_gather_qmv_i8(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -87,16 +118,65 @@ METAL_FUNC int i8_nvfp4_block_dot(const thread int8_t* xq, const device uint8_t*
   const int row_bytes = K / 2;
   float result[rows_per_simdgroup] = {0};
   thread int8_t xq[16];
+  thread int xi[16];
+  thread float xf[16];
   for (int b = simd_lid; b < n_blocks; b += SIMD_SIZE) {
+    if (U == 0) {
 #pragma clang loop unroll(full)
-    for (int j = 0; j < 16; j++) {
-      xq[j] = xr[b * 16 + j];
+      for (int j = 0; j < 16; j++) {
+        xq[j] = xr[b * 16 + j];
+      }
+    } else {
+      // 16 x values as four 4-byte loads (row starts are 16-byte aligned: K % 16 == 0, host checks the offset)
+      const device char4* xv = (const device char4*)(xr + b * 16);
+#pragma clang loop unroll(full)
+      for (int j = 0; j < 4; j++) {
+        const char4 c = xv[j];
+#pragma clang loop unroll(full)
+        for (int e = 0; e < 4; e++) {
+          xi[4 * j + e] = int(c[e]);
+          xf[4 * j + e] = float(c[e]);
+        }
+      }
     }
 #pragma clang loop unroll(full)
     for (int r = 0; r < rows_per_simdgroup; r++) {
       const int n = out_row + r;
       if (n < N) {
-        int p = i8_nvfp4_block_dot(xq, wbytes + int64_t(n) * row_bytes + b * 8);
+        const device uint8_t* wb = wbytes + int64_t(n) * row_bytes + b * 8;
+        int p;
+        if (U == 0) {
+          p = i8_nvfp4_block_dot(xq, wb);
+        } else if (U == 3) {
+          const uint2 wv = *(const device uint2*)wb;
+          float acc = 0.0f;
+#pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const uint t = i8_spread_nibbles(j < 2 ? (j == 0 ? wv.x & 0xFFFF : wv.x >> 16) : (j == 2 ? wv.y & 0xFFFF : wv.y >> 16));
+            const uint u0 = (t & 0xFFu) | ((t & 0xFF00u) << 8);
+            const uint u1 = ((t >> 16) & 0xFFu) | ((t >> 8) & 0xFF0000u);
+            const half2 h0 = as_type<half2>((((u0 & 0x00080008u) << 12) | ((u0 & 0x00070007u) << 9)));
+            const half2 h1 = as_type<half2>((((u1 & 0x00080008u) << 12) | ((u1 & 0x00070007u) << 9)));
+            acc = fma(xf[4 * j + 0], float(h0.x), acc);
+            acc = fma(xf[4 * j + 1], float(h0.y), acc);
+            acc = fma(xf[4 * j + 2], float(h1.x), acc);
+            acc = fma(xf[4 * j + 3], float(h1.y), acc);
+          }
+          p = int(acc * 32768.0f);
+        } else {
+          thread uint q[4];
+          i8_unpack_block<U>(*(const device uint2*)wb, q);
+          int acc = 0;
+#pragma clang loop unroll(full)
+          for (int j = 0; j < 4; j++) {
+            const char4 wc = as_type<char4>(q[j]);
+#pragma clang loop unroll(full)
+            for (int e = 0; e < 4; e++) {
+              acc += xi[4 * j + e] * int(wc[e]);
+            }
+          }
+          p = acc;
+        }
         result[r] += float(p) * i8_e4m3_to_float(scales[int64_t(n) * n_blocks + b]);
       }
     }

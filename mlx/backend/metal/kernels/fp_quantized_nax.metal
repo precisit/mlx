@@ -123,5 +123,11 @@ instantiate_quantized_qmm_hgs(bfloat16_t)
     // clang-format on
 
 // int8-activation x NVFP4 sorted gather (Precisit, modelopt-to-mlx A8 arm)
-instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2)
-instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2_u0", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2, 0)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2_u0", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2, 0)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2_u1", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2, 1)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2_u1", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2, 1)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2_u2", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2, 2)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2_u2", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2, 2)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2_u8", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2, 8)
+instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2_u8", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2, 8)
