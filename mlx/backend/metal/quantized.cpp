@@ -2208,11 +2208,26 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (route != "auto" && route != "vector" && route != "fallback" && route != "nax") {
     throw std::invalid_argument("[gather_qmm_i8] MLX_GATHER_QMM_I8_ROUTE must be auto|vector|fallback|nax");
   }
+  // Speed diagnostic (branch nvfp4-gather-qmm-i8-rescale-diag, A8-KERNEL.md step 2.4): NAX rescale variant and K tile.
+  // MLX_GATHER_QMM_I8_NAX_RESCALE 0 (gated kernel) | 1 | 2 | 3 | 6 | 7 | 8 (8: wrong numerics, timing bound);
+  // MLX_GATHER_QMM_I8_NAX_BK 64 (gated) | 128.
+  auto diag_env = [](const char* name, int dflt, std::initializer_list<int> ok) {
+    const char* v = std::getenv(name);
+    int u = v ? std::atoi(v) : dflt;
+    for (int o : ok) {
+      if (u == o) {
+        return u;
+      }
+    }
+    throw std::invalid_argument(std::string("[gather_qmm_i8] unsupported ") + name);
+  };
+  static const int nax_rescale = diag_env("MLX_GATHER_QMM_I8_NAX_RESCALE", 0, {0, 1, 2, 3, 6, 7, 8});
+  static const int nax_bk = diag_env("MLX_GATHER_QMM_I8_NAX_BK", 64, {64, 128});
   // Sorted, one row per (token, expert) assignment, many assignments: the prefill shape.
   if (route != "vector" && right_sorted_ && M == 1 && B >= 16) {
     int E = w.size() / w.shape(-1) / w.shape(-2);
     int rows = B;   // x is [rows, 1, K] here (one row per assignment)
-    const bool nax_ok = metal::is_nax_available() && K % 64 == 0 && N % 64 == 0 && x.size() / K == rows;
+    const bool nax_ok = metal::is_nax_available() && K % nax_bk == 0 && N % 64 == 0 && x.size() / K == rows;
     if (route == "nax" && !nax_ok) {
       throw std::runtime_error("[gather_qmm_i8] route nax requested but not available for this call");
     }
@@ -2223,7 +2238,8 @@ void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (w.offset() % 16 != 0) {
         throw std::runtime_error("[gather_qmm_i8] NAX kernel needs 16-byte aligned weights");
       }
-      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2";
+      std::string kname = std::string("fp_gather_qmm_rhs_nax_i8_bm") + std::to_string(bm) + "_bn64_bk" +
+          std::to_string(nax_bk) + "_wm2_wn2_r" + std::to_string(nax_rescale);
       auto kernel = d.get_kernel(kname);
       auto& enc = metal::get_command_encoder(s);
       enc.set_compute_pipeline_state(kernel);
