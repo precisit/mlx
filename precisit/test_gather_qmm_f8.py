@@ -18,7 +18,7 @@ import argparse, hashlib, json, os, sys
 import numpy as np
 import mlx.core as mx
 
-if os.environ.get("MLX_ENABLE_TF32") != "0":
+if os.environ.get("MLX_ENABLE_TF32") != "0" and "--compare" not in sys.argv:
     raise SystemExit("STOP: set MLX_ENABLE_TF32=0 (the fp32 reference is TF32 on NAX hosts otherwise)")
 
 E2M1_X2 = np.array([0, 1, 2, 3, 4, 6, 8, 12], np.int64)
@@ -168,8 +168,6 @@ def fg3(rng):
         E = 16
         wq, ws = weights(rng, E, N, K)
         for kind in ("decode", "sorted"):
-            if kind == "decode" and os.environ.get("MLX_GATHER_QMM_F8_ROUTE") == "nax":
-                out.append({"case": nm, "shape": kind, "skipped": "decode has no nax route", "pass": True}); continue
             if kind == "decode":
                 B, L, k = 2, 1, 10
                 x = mx.array((rng.standard_normal((B, L, 1, 1, K)) * np.exp(rng.standard_normal((B, L, 1, 1, K)))).astype(np.float32))
@@ -179,6 +177,8 @@ def fg3(rng):
                 x = mx.array((rng.standard_normal((Pn, 1, K)) * np.exp(rng.standard_normal((Pn, 1, K)))).astype(np.float32))
                 idx = mx.array(np.sort(rng.integers(0, E, Pn)).astype(np.uint32)); sort = True
             q, s = f8_quantize(x)
+            if kind == "decode" and os.environ.get("MLX_GATHER_QMM_F8_ROUTE") == "nax":   # inputs drawn all the same
+                out.append({"case": nm, "shape": kind, "skipped": "decode has no nax route", "pass": True}); continue
             y = np.array(run(q, s, wq, ws, idx, sort)).reshape(-1, N).astype(np.float64)
             DUMP[f"fg3_{nm}_{kind}"] = y.astype(np.float32)
             xr = mx.from_fp8(q, dtype=mx.float32) * s
