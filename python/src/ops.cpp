@@ -5048,6 +5048,28 @@ void init_ops(nb::module_& m) {
         accumulation round. Returns float32. GPU only.
       )pbdoc");
   m.def(
+      "gather_qmm_f8",
+      &mx::gather_qmm_f8,
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      "lhs_indices"_a = nb::none(),
+      "rhs_indices"_a = nb::none(),
+      nb::kw_only(),
+      "sorted_indices"_a = false,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def gather_qmm_f8(x_q: array, x_scale: array, w: array, scales: array, /, lhs_indices: array | None = None, rhs_indices: array | None = None, *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        E4M3-activation x NVFP4-weight gathered matmul, ``x @ w.T`` (Precisit fork, modelopt-to-mlx F8 arm).
+
+        ``x_q`` is uint8 E4M3 codes with one float32 scale per row (``x_scale``, shape ``x_q.shape[:-1] + [1]``);
+        ``w`` and ``scales`` are nvfp4 (group 16) without a global scale, which the caller applies. Every product
+        is exact; each 16-wide block sum is an fp32 sum, then E4M3 block scaling and fp32 accumulation.
+        Returns float32. GPU only.
+      )pbdoc");
+  m.def(
       "gather_qqmm",
       &mx::gather_qqmm,
       nb::arg(),

@@ -180,8 +180,12 @@ if(NOT MLX_METAL_JIT)
                  gated_delta_nax_ops.h ${STEEL_NAX_HEADERS})
     build_kernel(gated_delta_update_nax_vjp gated_delta_update_nax_vjp.h
                  gated_delta_nax_ops.h ${STEEL_NAX_HEADERS})
-    build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h fp_quantized_nax_i8.h fp_quantized_i8_utils.h
+    build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h fp_quantized_nax_i8.h fp_quantized_nax_f8.h fp_quantized_i8_utils.h
                  ${STEEL_NAX_HEADERS})
+    if(MLX_METAL_VERSION LESS 410)
+      # The F8 kernels in fp_quantized_nax_f8.h need Metal 4.1 (fp8 tensor formats)
+      target_compile_definitions(mlx PRIVATE MLX_METAL_NO_FP8)
+    endif()
 
     build_kernel(steel/attn/kernels/steel_attention_nax
                  ${STEEL_NAX_ATTN_HEADERS})

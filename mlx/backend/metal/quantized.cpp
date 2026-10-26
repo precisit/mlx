@@ -2174,7 +2174,112 @@ void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       mode);
 }
 
+// F8 arm (modelopt-to-mlx PROTOCOL amendment 17): x_q holds E4M3 codes (uint8), one float scale per row. Routes:
+// NAX (fp_quantized_nax_f8.h; Metal 4.1 build, NAX GPU, macOS 27) for the sorted prefill shape when K, N % 64 == 0,
+// else the vector kernel (fp_gather_qmv_f8) for every shape. MLX_GATHER_QMM_F8_ROUTE = auto | vector | nax;
+// MLX_GATHER_QMM_F8_RELAXED = 0 (default) | 1 selects matmul2d's relaxed_precision on the NAX route (a reading).
+static void gather_qmm_f8_gpu(const std::vector<array>& inputs, array& out, bool right_sorted, const Stream& s) {
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array x = ensure_row_contiguous_matrix(inputs[0], d, s);
+  array xs = ensure_row_contiguous(inputs[1], d, s);
+  array w = ensure_row_contiguous_matrix(inputs[2], d, s);
+  array scales = ensure_row_contiguous_matrix(inputs[3], d, s);
+  const array& lhs_indices = inputs[4];
+  const array& rhs_indices = inputs[5];
+  if (!x.flags().row_contiguous || !xs.flags().row_contiguous) {
+    x = contiguous_copy_gpu(x, s);
+    xs = contiguous_copy_gpu(xs, s);
+    metal::get_command_encoder(s).add_temporaries({x, xs});
+  }
+
+  int K = x.shape(-1);
+  int M = x.shape(-2);
+  int N = out.shape(-1);
+  int B = out.size() / M / N;
+
+  static const std::string route = [] {
+    const char* v = std::getenv("MLX_GATHER_QMM_F8_ROUTE");
+    return std::string(v ? v : "auto");
+  }();
+  static const bool relaxed = [] {
+    const char* v = std::getenv("MLX_GATHER_QMM_F8_RELAXED");
+    return v && std::string(v) == "1";
+  }();
+  if (route != "auto" && route != "vector" && route != "nax") {
+    throw std::invalid_argument("[gather_qmm_f8] MLX_GATHER_QMM_F8_ROUTE must be auto|vector|nax");
+  }
+  bool fp8_nax = false;
+#ifndef MLX_METAL_NO_FP8
+  if (__builtin_available(macOS 27, iOS 27, tvOS 27, visionOS 27, *)) {
+    fp8_nax = metal::is_nax_available();
+  }
+#endif
+  if (route != "vector" && right_sorted && M == 1 && B >= 16) {
+    int E = w.size() / w.shape(-1) / w.shape(-2);
+    int rows = B;
+    const bool nax_ok = fp8_nax && K % 64 == 0 && N % 64 == 0 && x.size() / K == rows;
+    if (route == "nax" && !nax_ok) {
+      throw std::runtime_error("[gather_qmm_f8] route nax requested but not available for this call");
+    }
+    if (nax_ok) {
+      array offsets = gather_mm_offsets(rhs_indices, E, rows, d, s);
+      int bm = (rows / E < 64) ? 32 : 64;
+      if (w.offset() % 16 != 0) {
+        throw std::runtime_error("[gather_qmm_f8] NAX kernel needs 16-byte aligned weights");
+      }
+      std::string kname = std::string("fp_gather_qmm_rhs_nax_f8_bm") + std::to_string(bm) + "_bn64_bk64_wm2_wn2_rx" +
+          (relaxed ? "1" : "0");
+      auto kernel = d.get_kernel(kname);
+      auto& enc = metal::get_command_encoder(s);
+      enc.set_compute_pipeline_state(kernel);
+      enc.set_input_array(x, 0);
+      enc.set_input_array(xs, 1);
+      enc.set_input_array(w, 2);
+      enc.set_input_array(scales, 3);
+      enc.set_input_array(offsets, 4);
+      enc.set_output_array(out, 5);
+      enc.set_bytes(rows, 6);
+      enc.set_bytes(N, 7);
+      enc.set_bytes(K, 8);
+      enc.set_bytes(E, 9);
+      MTL::Size group_dims(32, 2, 2);
+      MTL::Size grid_dims(N / 64, std::min(rows, (rows + bm - 1) / bm + E - 1), 1);
+      enc.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+  } else if (route == "nax") {
+    throw std::runtime_error("[gather_qmm_f8] route nax requested but not available for this call");
+  }
+
+  if (w.offset() % 8 != 0 || x.offset() % 16 != 0) {
+    throw std::runtime_error("[gather_qmm_f8] vector kernel needs 8-byte aligned weights and 16-byte aligned x");
+  }
+  auto kernel = d.get_kernel("fp_gather_qmv_f8");
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(w, 0);
+  enc.set_input_array(scales, 1);
+  enc.set_input_array(x, 2);
+  enc.set_input_array(xs, 3);
+  enc.set_input_array(lhs_indices, 4);
+  enc.set_input_array(rhs_indices, 5);
+  enc.set_output_array(out, 6);
+  enc.set_bytes(K, 7);
+  enc.set_bytes(N, 8);
+  int c = add_strides_and_shapes(enc, false, x, w, scales, std::nullopt, 9);
+  add_gather_strides_and_shapes(enc, lhs_indices, rhs_indices, c);
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(M, (N + 7) / 8, B);
+  enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void GatherQMMI8::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs[0].dtype() == uint8) {   // F8 arm: E4M3 activation codes
+    gather_qmm_f8_gpu(inputs, out, right_sorted_, stream());
+    return;
+  }
   // inputs: x_q int8 [..., M, K], x_scale f32 [..., M, 1], w uint32 [E, N, K/8], scales uint8 [E, N, K/16],
   // lhs_indices, rhs_indices. One vector kernel for every shape for now (fp_quantized_i8.h): every
   // output is sum_b e4m3(S) * (exact int32 block partial), times x_scale / 2.

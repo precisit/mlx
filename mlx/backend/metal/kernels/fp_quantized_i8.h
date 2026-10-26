@@ -136,3 +136,95 @@ METAL_FUNC float i8_nvfp4_block_dot(const thread float* xf, uint2 wv) {
     uint2 gid [[thread_position_in_grid]]) {
   y[size_t(gid.y) * N + gid.x] *= x_scale[gid.y];
 }
+
+// F8 arm (modelopt-to-mlx PROTOCOL amendment 17): the same kernel with x_q as E4M3 codes (uint8), one float scale
+// per row (max|x| / 448). Every product x_q * 2*e2m1 is exact in fp32 (at most 6 significant bits); the 16-term block
+// sum is not always exact, because E4M3 spans about 18 binades: i8_nvfp4_block_dot sums it in fp32, in order, within
+// gamma_15 * sum |products| of the exact sum (gate F-G2). Block scaling and accumulation as fp_gather_qmv_i8.
+[[kernel]] void fp_gather_qmv_f8(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* scales [[buffer(1)]],
+    const device uint8_t* x [[buffer(2)]],
+    const device float* x_scale [[buffer(3)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* rhs_indices [[buffer(5)]],
+    device float* y [[buffer(6)]],
+    const constant int& K [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& x_batch_ndims [[buffer(9)]],
+    const constant int* x_shape [[buffer(10)]],
+    const constant int64_t* x_strides [[buffer(11)]],
+    const constant int& w_batch_ndims [[buffer(12)]],
+    const constant int* w_shape [[buffer(13)]],
+    const constant int64_t* w_strides [[buffer(14)]],
+    const constant int64_t* s_strides [[buffer(15)]],
+    const constant int& batch_ndims [[buffer(16)]],
+    const constant int* batch_shape [[buffer(17)]],
+    const constant int64_t* lhs_strides [[buffer(18)]],
+    const constant int64_t* rhs_strides [[buffer(19)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int rows_per_simdgroup = 4;
+  constexpr int num_simdgroups = 2;
+  const int M = x_shape[x_batch_ndims];
+
+  uint32_t x_idx, w_idx;
+  if (batch_ndims == 1) {
+    x_idx = lhs_indices[tid.z * lhs_strides[0]];
+    w_idx = rhs_indices[tid.z * rhs_strides[0]];
+  } else {
+    ulong2 idx = elem_to_loc_broadcast(tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
+    x_idx = lhs_indices[idx.x];
+    w_idx = rhs_indices[idx.y];
+  }
+  int64_t x_off = (x_batch_ndims == 1) ? int64_t(x_idx) * x_strides[0]
+                                       : int64_t(elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims));
+  const device uint8_t* xr = x + x_off + int64_t(tid.x) * K;
+  const float xs = x_scale[x_off / K + tid.x];
+  const device uint8_t* wbytes = (const device uint8_t*)w;
+  if (w_batch_ndims == 1) {
+    wbytes += int64_t(w_idx) * w_strides[0] * 4;
+    scales += int64_t(w_idx) * s_strides[0];
+  } else {
+    ulong2 idx = elem_to_loc_broadcast(w_idx, w_shape, w_strides, s_strides, w_batch_ndims);
+    wbytes += idx.x * 4;
+    scales += idx.y;
+  }
+  y += int64_t(tid.z) * M * N + int64_t(tid.x) * N;
+
+  const int out_row = tid.y * (num_simdgroups * rows_per_simdgroup) + simd_gid * rows_per_simdgroup;
+  if (out_row >= N) {
+    return;
+  }
+  const int n_blocks = K / 16;
+  const int row_bytes = K / 2;
+  float result[rows_per_simdgroup] = {0};
+  thread float xf[16];
+  for (int b = simd_lid; b < n_blocks; b += SIMD_SIZE) {
+    const device uchar4* xv = (const device uchar4*)(xr + b * 16);
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4; j++) {
+      const uchar4 c = xv[j];
+#pragma clang loop unroll(full)
+      for (int e = 0; e < 4; e++) {
+        xf[4 * j + e] = i8_e4m3_to_float(c[e]);
+      }
+    }
+#pragma clang loop unroll(full)
+    for (int r = 0; r < rows_per_simdgroup; r++) {
+      const int n = out_row + r;
+      if (n < N) {
+        const float p = i8_nvfp4_block_dot(xf, *(const device uint2*)(wbytes + int64_t(n) * row_bytes + b * 8));
+        result[r] += p * i8_e4m3_to_float(scales[int64_t(n) * n_blocks + b]);
+      }
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int r = 0; r < rows_per_simdgroup; r++) {
+    float v = simd_sum(result[r]);
+    if (simd_lid == 0 && out_row + r < N) {
+      y[out_row + r] = v * xs * 0.5f;
+    }
+  }
+}

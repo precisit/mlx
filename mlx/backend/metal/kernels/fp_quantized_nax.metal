@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "mlx/backend/metal/kernels/fp_quantized_nax.h"
 #include "mlx/backend/metal/kernels/fp_quantized_nax_i8.h"
+#include "mlx/backend/metal/kernels/fp_quantized_nax_f8.h"
 
 
 #define instantiate_quantized_batched(mode, name, type, bm, bn, bk, wm, wn, batched, group_size, bits) \
@@ -125,3 +126,11 @@ instantiate_quantized_qmm_hgs(bfloat16_t)
 // int8-activation x NVFP4 sorted gather (Precisit, modelopt-to-mlx A8 arm)
 instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm64_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 64, 64, 64, 2, 2)
 instantiate_kernel("fp_gather_qmm_rhs_nax_i8_bm32_bn64_bk64_wm2_wn2", fp_gather_qmm_rhs_nax_i8, 32, 64, 64, 2, 2)
+
+// E4M3-activation x NVFP4 sorted gather (Precisit, modelopt-to-mlx F8 arm, amendment 17); Metal 4.1 only
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 410)
+instantiate_kernel("fp_gather_qmm_rhs_nax_f8_bm64_bn64_bk64_wm2_wn2_rx0", fp_gather_qmm_rhs_nax_f8, 64, 64, 64, 2, 2, false)
+instantiate_kernel("fp_gather_qmm_rhs_nax_f8_bm32_bn64_bk64_wm2_wn2_rx0", fp_gather_qmm_rhs_nax_f8, 32, 64, 64, 2, 2, false)
+instantiate_kernel("fp_gather_qmm_rhs_nax_f8_bm64_bn64_bk64_wm2_wn2_rx1", fp_gather_qmm_rhs_nax_f8, 64, 64, 64, 2, 2, true)
+instantiate_kernel("fp_gather_qmm_rhs_nax_f8_bm32_bn64_bk64_wm2_wn2_rx1", fp_gather_qmm_rhs_nax_f8, 32, 64, 64, 2, 2, true)
+#endif
